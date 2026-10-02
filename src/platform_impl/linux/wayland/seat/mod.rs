@@ -218,6 +218,9 @@ impl SeatHandler for WinitState {
             .data_device_manager_state
             .as_ref()
             .map(|manager| manager.get_data_device(queue_handle, &seat));
+        if let Some(data_device) = &data_device {
+            self.clipboard.add_seat(seat.id(), data_device.inner().clone());
+        }
         self.seats.insert(seat.id(), WinitSeatState::new(data_device));
     }
 
@@ -230,6 +233,7 @@ impl SeatHandler for WinitState {
         // W15 (winit#4729): end a file drag in progress on this seat; W2 (winit#4747): the text
         // input is destroyed only here, when the seat itself goes away.
         self.cancel_file_drag(&seat.id());
+        self.clipboard.remove_seat(&seat.id());
         if let Some(mut seat_state) = self.seats.remove(&seat.id()) {
             if let Some(text_input) = seat_state.text_input.take() {
                 text_input.destroy();
