@@ -6,13 +6,15 @@ use std::time::Instant;
 use objc2::rc::Retained;
 use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSRunningApplication,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
+    NSApplicationTerminateReply, NSRunningApplication,
 };
 use objc2_foundation::{MainThreadMarker, NSNotification, NSObject, NSObjectProtocol};
 
 use super::event_handler::EventHandler;
 use super::event_loop::{notify_windows_of_exit, stop_app_immediately, ActiveEventLoop, PanicInfo};
 use super::observer::{EventLoopWaker, RunLoop};
+use super::window::WinitWindow;
 use super::{menu, WindowId, DEVICE_ID};
 use crate::event::{DeviceEvent, Event, StartCause, WindowEvent};
 use crate::event_loop::{ActiveEventLoop as RootActiveEventLoop, ControlFlow};
@@ -23,6 +25,8 @@ pub(super) struct AppState {
     activation_policy: Option<NSApplicationActivationPolicy>,
     default_menu: bool,
     activate_ignoring_other_apps: bool,
+    close_requested_on_terminate: bool,
+    termination_queued: Cell<bool>,
     run_loop: RunLoop,
     event_handler: EventHandler,
     stop_on_launch: Cell<bool>,
@@ -61,6 +65,11 @@ declare_class!(
     unsafe impl NSObjectProtocol for ApplicationDelegate {}
 
     unsafe impl NSApplicationDelegate for ApplicationDelegate {
+        #[method(applicationShouldTerminate:)]
+        fn app_should_terminate(&self, application: &NSApplication) -> NSApplicationTerminateReply {
+            self.should_terminate(application)
+        }
+
         #[method(applicationDidFinishLaunching:)]
         fn app_did_finish_launching(&self, notification: &NSNotification) {
             self.did_finish_launching(notification)
@@ -79,11 +88,14 @@ impl ApplicationDelegate {
         activation_policy: Option<NSApplicationActivationPolicy>,
         default_menu: bool,
         activate_ignoring_other_apps: bool,
+        close_requested_on_terminate: bool,
     ) -> Retained<Self> {
         let this = mtm.alloc().set_ivars(AppState {
             activation_policy,
             default_menu,
             activate_ignoring_other_apps,
+            close_requested_on_terminate,
+            termination_queued: Cell::new(false),
             run_loop: RunLoop::main(mtm),
             event_handler: EventHandler::new(),
             stop_on_launch: Cell::new(false),
@@ -161,6 +173,49 @@ impl ApplicationDelegate {
             let app = NSApplication::sharedApplication(mtm);
             stop_app_immediately(&app);
         }
+    }
+
+    fn should_terminate(&self, application: &NSApplication) -> NSApplicationTerminateReply {
+        trace_scope!("applicationShouldTerminate:");
+        if !self.ivars().close_requested_on_terminate || !self.is_running() || self.exiting() {
+            return NSApplicationTerminateReply::NSTerminateNow;
+        }
+
+        // Native panels and other libraries' windows must not become Winit events.
+        // Snapshot IDs, not windows: a window closed before delivery must stay closed.
+        let windows: Vec<_> = application
+            .windows()
+            .iter()
+            .filter(|window| window.is_kind_of::<WinitWindow>())
+            .map(|window| WindowId(window as *const _ as usize))
+            .collect();
+        if windows.is_empty() {
+            return NSApplicationTerminateReply::NSTerminateNow;
+        }
+        if !self.ivars().termination_queued.replace(true) {
+            let this = self.retain();
+            self.ivars().run_loop.queue_closure(move || {
+                let app = NSApplication::sharedApplication(MainThreadMarker::from(&*this));
+                for id in windows {
+                    if !this.is_running() || this.exiting() {
+                        break;
+                    }
+                    let still_open = app.windows().iter().any(|window| {
+                        window.is_kind_of::<WinitWindow>()
+                            && WindowId(window as *const _ as usize) == id
+                    });
+                    if still_open {
+                        // Never re-enter a handler, including a native panel's nested loop.
+                        this.maybe_queue_window_event(id, WindowEvent::CloseRequested);
+                    }
+                }
+                this.ivars().termination_queued.set(false);
+            });
+            self.ivars().run_loop.wakeup();
+        }
+        // NSTerminateLater enters an AppKit modal loop and can prevent normal redraws.
+        // Cancel now, then let the application exit through its ordinary event loop.
+        NSApplicationTerminateReply::NSTerminateCancel
     }
 
     fn will_terminate(&self, _notification: &NSNotification) {

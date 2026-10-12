@@ -86,7 +86,8 @@ cfg_aliases = "0.2.1"
 [dependencies]
 bitflags = "2"
 cursor-icon = "1.1.0"
-dpi = { version = "0.1.1", path = "dpi" }
+# Keep the published crate's registry resolution when consuming this Git revision.
+dpi = "0.1.1"
 rwh_04 = { package = "raw-window-handle", version = "0.4", optional = true }
 rwh_05 = { package = "raw-window-handle", version = "0.5.2", features = [
     "std",
@@ -376,3 +377,8 @@ edition = "2021"
 [workspace.dependencies]
 serde = { version = "1", features = ["serde_derive"] }
 mint = "0.5.6"
+
+[[test]]
+name = "macos_termination"
+path = "tests/macos_termination.rs"
+harness = false
