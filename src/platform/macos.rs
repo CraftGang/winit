@@ -433,6 +433,21 @@ pub trait EventLoopBuilderExtMacOS {
     ///
     /// The default behavior is to ignore other applications and activate when launched.
     fn with_activate_ignoring_other_apps(&mut self, ignore: bool) -> &mut Self;
+
+    /// Route native application termination (for example, Quit from the Dock) to
+    /// [`WindowEvent::CloseRequested`](crate::event::WindowEvent::CloseRequested) for each
+    /// open Winit window instead of terminating immediately.
+    ///
+    /// Disabled by default. When enabled, Winit cancels the native termination request and
+    /// queues close requests on the ordinary event loop. The application may keep running
+    /// or call [`ActiveEventLoop::exit`](crate::event_loop::ActiveEventLoop::exit) once its
+    /// unsaved-document prompts are complete. Repeated requests are coalesced while a
+    /// queued request is being delivered. Requests with no Winit windows, outside a running
+    /// event loop, or after the event loop has been asked to exit terminate normally.
+    ///
+    /// This also applies to system logout/shutdown requests; applications must finish or
+    /// cancel their own confirmation flow. Force Quit cannot be intercepted.
+    fn with_close_requested_on_terminate(&mut self, enable: bool) -> &mut Self;
 }
 
 impl<T> EventLoopBuilderExtMacOS for EventLoopBuilder<T> {
@@ -451,6 +466,12 @@ impl<T> EventLoopBuilderExtMacOS for EventLoopBuilder<T> {
     #[inline]
     fn with_activate_ignoring_other_apps(&mut self, ignore: bool) -> &mut Self {
         self.platform_specific.activate_ignoring_other_apps = ignore;
+        self
+    }
+
+    #[inline]
+    fn with_close_requested_on_terminate(&mut self, enable: bool) -> &mut Self {
+        self.platform_specific.close_requested_on_terminate = enable;
         self
     }
 }
