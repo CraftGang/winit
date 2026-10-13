@@ -84,6 +84,7 @@ impl EventProcessor {
         let window_target = Self::window_target_mut(&mut self.target);
 
         // Handle IME requests.
+        let mut ime_focus = None;
         while let Ok(request) = self.ime_receiver.try_recv() {
             let ime = match window_target.ime.as_mut() {
                 Some(ime) => ime,
@@ -95,9 +96,24 @@ impl EventProcessor {
                     ime.send_xim_spot(window_id, x, y);
                 },
                 ImeRequest::Allow(window_id, allowed) => {
-                    ime.set_ime_allowed(window_id, allowed);
+                    let result = ime.set_ime_allowed(window_id, allowed);
+                    if self.active_window == Some(window_id as xproto::Window) {
+                        match result {
+                            Ok(true) => ime_focus = Some(window_id),
+                            Err(_) => ime_focus = None,
+                            Ok(false) => {},
+                        }
+                    }
                 },
             }
+        }
+
+        // PdfCraft patch: replacing the focused window's input context (egui allows IME whenever a
+        // text field gains focus and disallows it when it loses focus) generates no focus event, so
+        // the new context stayed unfocused until the window lost and regained focus. Focus the last
+        // context replaced in this batch, once (rust-windowing/winit#4727).
+        if let (Some(window_id), Some(ime)) = (ime_focus, window_target.ime.as_mut()) {
+            let _ = ime.get_mut().focus(window_id);
         }
 
         // Drain IME events.
@@ -680,10 +696,10 @@ impl EventProcessor {
             drop(shared_state_lock);
 
             if moved {
-                callback(&self.target, Event::WindowEvent {
-                    window_id,
-                    event: WindowEvent::Moved(outer.into()),
-                });
+                callback(
+                    &self.target,
+                    Event::WindowEvent { window_id, event: WindowEvent::Moved(outer.into()) },
+                );
             }
             outer
         };
@@ -728,13 +744,16 @@ impl EventProcessor {
                 drop(shared_state_lock);
 
                 let inner_size = Arc::new(Mutex::new(new_inner_size));
-                callback(&self.target, Event::WindowEvent {
-                    window_id,
-                    event: WindowEvent::ScaleFactorChanged {
-                        scale_factor: new_scale_factor,
-                        inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&inner_size)),
+                callback(
+                    &self.target,
+                    Event::WindowEvent {
+                        window_id,
+                        event: WindowEvent::ScaleFactorChanged {
+                            scale_factor: new_scale_factor,
+                            inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&inner_size)),
+                        },
                     },
-                });
+                );
 
                 let new_inner_size = *inner_size.lock().unwrap();
                 drop(inner_size);
@@ -781,10 +800,13 @@ impl EventProcessor {
         }
 
         if resized {
-            callback(&self.target, Event::WindowEvent {
-                window_id,
-                event: WindowEvent::Resized(new_inner_size.into()),
-            });
+            callback(
+                &self.target,
+                Event::WindowEvent {
+                    window_id,
+                    event: WindowEvent::Resized(new_inner_size.into()),
+                },
+            );
         }
     }
 
@@ -1506,10 +1528,13 @@ impl EventProcessor {
         }
         let physical_key = xkb::raw_keycode_to_physicalkey(keycode);
 
-        callback(&self.target, Event::DeviceEvent {
-            device_id,
-            event: DeviceEvent::Key(RawKeyEvent { physical_key, state }),
-        });
+        callback(
+            &self.target,
+            Event::DeviceEvent {
+                device_id,
+                event: DeviceEvent::Key(RawKeyEvent { physical_key, state }),
+            },
+        );
     }
 
     fn xinput2_hierarchy_changed<T: 'static, F>(&mut self, xev: &XIHierarchyEvent, mut callback: F)
@@ -1524,15 +1549,21 @@ impl EventProcessor {
         for info in infos {
             if 0 != info.flags & (xinput2::XISlaveAdded | xinput2::XIMasterAdded) {
                 self.init_device(info.deviceid as xinput::DeviceId);
-                callback(&self.target, Event::DeviceEvent {
-                    device_id: mkdid(info.deviceid as xinput::DeviceId),
-                    event: DeviceEvent::Added,
-                });
+                callback(
+                    &self.target,
+                    Event::DeviceEvent {
+                        device_id: mkdid(info.deviceid as xinput::DeviceId),
+                        event: DeviceEvent::Added,
+                    },
+                );
             } else if 0 != info.flags & (xinput2::XISlaveRemoved | xinput2::XIMasterRemoved) {
-                callback(&self.target, Event::DeviceEvent {
-                    device_id: mkdid(info.deviceid as xinput::DeviceId),
-                    event: DeviceEvent::Removed,
-                });
+                callback(
+                    &self.target,
+                    Event::DeviceEvent {
+                        device_id: mkdid(info.deviceid as xinput::DeviceId),
+                        event: DeviceEvent::Removed,
+                    },
+                );
                 let mut devices = self.devices.borrow_mut();
                 devices.remove(&DeviceId(info.deviceid as xinput::DeviceId));
             }
@@ -1848,7 +1879,7 @@ impl EventProcessor {
                 .find(|prev_monitor| prev_monitor.name == new_monitor.name)
                 .map(|prev_monitor| prev_monitor.scale_factor);
             if Some(new_monitor.scale_factor) != maybe_prev_scale_factor {
-                for window in wt.windows.borrow().iter().filter_map(|(_, w)| w.upgrade()) {
+                for window in wt.windows.borrow().values().filter_map(|w| w.upgrade()) {
                     window.refresh_dpi_for_monitor(&new_monitor, maybe_prev_scale_factor, |event| {
                         callback(&self.target, event);
                     })

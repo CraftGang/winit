@@ -14,9 +14,11 @@ pub use event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 pub use output::{MonitorHandle, VideoModeHandle};
 pub use window::Window;
 
+pub(crate) mod clipboard;
 mod event_loop;
 mod output;
 mod seat;
+pub(crate) use seat::dnd::parse_uri_list;
 mod state;
 mod types;
 mod window;

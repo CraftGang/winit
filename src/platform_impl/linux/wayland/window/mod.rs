@@ -79,6 +79,56 @@ pub struct Window {
 }
 
 impl Window {
+    pub fn wayland_clipboard(&self) -> super::clipboard::WaylandClipboard {
+        super::clipboard::WaylandClipboard {
+            state: self
+                .window_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clipboard
+                .clone(),
+            waker: self.event_loop_awakener.clone(),
+        }
+    }
+    pub fn wayland_connection(&self) -> Option<sctk::reexports::client::Connection> {
+        self.display.backend().upgrade().map(sctk::reexports::client::Connection::from_backend)
+    }
+    pub fn take_file_transfer_tokens(&self) -> Vec<crate::platform::wayland::FileTransferToken> {
+        std::mem::take(
+            &mut self
+                .window_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .file_transfer_tokens,
+        )
+    }
+    pub fn finish_file_transfer(&self, id: u64) {
+        let mut completed = self
+            .window_requests
+            .file_transfer_completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if completed.len() < 16 {
+            completed.push(id);
+        }
+        self.event_loop_awakener.ping();
+    }
+    pub fn caps_lock_state(&self) -> Option<bool> {
+        self.window_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).caps_lock
+    }
+    pub fn take_tablet_input(&self) -> Vec<crate::platform::wayland::TabletInput> {
+        self.window_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_tablet_input()
+    }
+    pub fn tablet_input_available(&self) -> bool {
+        self.window_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tablet_input_available
+    }
+
     pub(crate) fn new(
         event_loop_window_target: &ActiveEventLoop,
         attributes: WindowAttributes,
@@ -188,6 +238,7 @@ impl Window {
         state.windows.get_mut().insert(window_id, window_state.clone());
 
         let window_requests = WindowRequests {
+            file_transfer_completed: Mutex::new(Vec::new()),
             redraw_requested: AtomicBool::new(true),
             closed: AtomicBool::new(false),
         };
@@ -730,6 +781,7 @@ pub struct WindowRequests {
 
     /// Redraw Requested.
     pub redraw_requested: AtomicBool,
+    pub file_transfer_completed: Mutex<Vec<u64>>,
 }
 
 impl WindowRequests {

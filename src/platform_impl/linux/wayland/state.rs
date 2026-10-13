@@ -26,7 +26,7 @@ use sctk::subcompositor::SubcompositorState;
 use crate::platform_impl::wayland::event_loop::sink::EventSink;
 use crate::platform_impl::wayland::output::MonitorHandle;
 use crate::platform_impl::wayland::seat::{
-    PointerConstraintsState, RelativePointerState, TextInputState, WinitPointerData,
+    DndState, PointerConstraintsState, RelativePointerState, TextInputState, WinitPointerData,
     WinitPointerDataExt, WinitSeatState,
 };
 use crate::platform_impl::wayland::types::kwin_blur::KWinBlurManager;
@@ -109,6 +109,19 @@ pub struct WinitState {
     /// KWin blur manager.
     pub kwin_blur_manager: Option<KWinBlurManager>,
 
+    /// Data device manager, for drag and drop.
+    pub data_device_manager:
+        Option<sctk::reexports::client::protocol::wl_data_device_manager::WlDataDeviceManager>,
+    pub tablet_manager: Option<super::seat::tablet::TabletManager>,
+    pub tablet_tools: AHashMap<
+        ObjectId,
+        sctk::reexports::protocols::wp::tablet::zv2::client::zwp_tablet_tool_v2::ZwpTabletToolV2,
+    >,
+
+    /// The drag and drop currently over one of our windows.
+    pub dnd: DndState,
+    pub(crate) clipboard: Arc<Mutex<super::clipboard::ClipboardState>>,
+
     /// Loop handle to re-register event sources, such as keyboard repeat.
     pub loop_handle: LoopHandle<'static, Self>,
 
@@ -143,9 +156,13 @@ impl WinitState {
 
         let seat_state = SeatState::new(globals, queue_handle);
 
+        let tablet_manager = super::seat::tablet::TabletManager::new(globals, queue_handle).ok();
         let mut seats = AHashMap::default();
         for seat in seat_state.seats() {
-            seats.insert(seat.id(), WinitSeatState::new());
+            let mut state = WinitSeatState::new();
+            state.tablet_seat =
+                tablet_manager.as_ref().map(|manager| manager.seat(&seat, queue_handle));
+            seats.insert(seat.id(), state);
         }
 
         let (viewporter_state, fractional_scaling_manager) =
@@ -188,6 +205,11 @@ impl WinitState {
             pointer_surfaces: Default::default(),
 
             monitors: Arc::new(Mutex::new(monitors)),
+            data_device_manager: globals.bind(queue_handle, 1..=3, ()).ok(),
+            tablet_manager,
+            tablet_tools: Default::default(),
+            dnd: DndState::default(),
+            clipboard: Arc::new(Mutex::new(super::clipboard::ClipboardState::default())),
             events_sink: EventSink::new(),
             loop_handle,
             // Make it true by default.

@@ -30,6 +30,24 @@ impl Dispatch<WlKeyboard, KeyboardData, WinitState> for WinitState {
         _: &Connection,
         _: &QueueHandle<WinitState>,
     ) {
+        {
+            let mut clipboard =
+                state.clipboard.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &event {
+                WlKeyboardEvent::Enter { surface, serial, .. } => clipboard.focus(
+                    &data.seat.id(),
+                    state.windows.borrow().contains_key(&wayland::make_wid(surface)),
+                    *serial,
+                ),
+                WlKeyboardEvent::Leave { serial, .. } => {
+                    clipboard.focus(&data.seat.id(), false, *serial)
+                },
+                WlKeyboardEvent::Key { serial, .. } | WlKeyboardEvent::Modifiers { serial, .. } => {
+                    clipboard.input(&data.seat.id(), *serial)
+                },
+                _ => {},
+            }
+        }
         let seat_state = match state.seats.get_mut(&data.seat.id()) {
             Some(seat_state) => seat_state,
             None => {
@@ -70,6 +88,7 @@ impl Dispatch<WlKeyboard, KeyboardData, WinitState> for WinitState {
                         let mut window = window.lock().unwrap();
                         let was_unfocused = !window.has_focus();
                         window.add_seat_focus(data.seat.id());
+                        window.caps_lock = seat_state.caps_lock;
                         was_unfocused
                     },
                     None => return,
@@ -112,6 +131,9 @@ impl Dispatch<WlKeyboard, KeyboardData, WinitState> for WinitState {
                     Some(window) => {
                         let mut window = window.lock().unwrap();
                         window.remove_seat_focus(&data.seat.id());
+                        if !window.has_focus() {
+                            window.caps_lock = None;
+                        }
                         window.has_focus()
                     },
                     None => return,
@@ -235,6 +257,7 @@ impl Dispatch<WlKeyboard, KeyboardData, WinitState> for WinitState {
                 };
 
                 xkb_state.update_modifiers(mods_depressed, mods_latched, mods_locked, 0, 0, group);
+                seat_state.caps_lock = Some(xkb_state.modifiers().caps_lock);
                 seat_state.modifiers = xkb_state.modifiers().into();
 
                 // HACK: part of the workaround from `WlKeyboardEvent::Enter`.
@@ -246,6 +269,10 @@ impl Dispatch<WlKeyboard, KeyboardData, WinitState> for WinitState {
                     },
                 };
 
+                if let Some(window) = state.windows.get_mut().get(&window_id) {
+                    window.lock().unwrap_or_else(std::sync::PoisonError::into_inner).caps_lock =
+                        seat_state.caps_lock;
+                }
                 state.events_sink.push_window_event(
                     WindowEvent::ModifiersChanged(seat_state.modifiers.into()),
                     window_id,

@@ -19,11 +19,14 @@ use crate::event::WindowEvent;
 use crate::keyboard::ModifiersState;
 use crate::platform_impl::wayland::state::WinitState;
 
+pub(crate) mod dnd;
 mod keyboard;
 mod pointer;
+pub(crate) mod tablet;
 mod text_input;
 mod touch;
 
+pub use dnd::DndState;
 pub use pointer::relative_pointer::RelativePointerState;
 pub use pointer::{PointerConstraintsState, WinitPointerData, WinitPointerDataExt};
 pub use text_input::{TextInputState, ZwpTextInputV3Ext};
@@ -36,6 +39,12 @@ use touch::TouchPoint;
 pub struct WinitSeatState {
     /// The pointer bound on the seat.
     pointer: Option<Arc<ThemedPointer<WinitPointerData>>>,
+
+    /// The data device bound on the seat, for drag and drop.
+    data_device: Option<sctk::reexports::client::protocol::wl_data_device::WlDataDevice>,
+    pub(crate) tablet_seat: Option<
+        sctk::reexports::protocols::wp::tablet::zv2::client::zwp_tablet_seat_v2::ZwpTabletSeatV2,
+    >,
 
     /// The touch bound on the seat.
     touch: Option<WlTouch>,
@@ -57,6 +66,7 @@ pub struct WinitSeatState {
 
     /// Whether we have pending modifiers.
     modifiers_pending: bool,
+    caps_lock: Option<bool>,
 }
 
 impl WinitSeatState {
@@ -132,6 +142,20 @@ impl SeatHandler for WinitState {
             _ => (),
         }
 
+        if seat_state.data_device.is_none() {
+            seat_state.data_device = self
+                .data_device_manager
+                .as_ref()
+                .map(|manager| manager.get_data_device(&seat, queue_handle, ()));
+        }
+
+        if let Some(device) = seat_state.data_device.as_ref() {
+            self.clipboard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .register(seat.id(), device.clone());
+        }
+
         if let Some(text_input_state) =
             seat_state.text_input.is_none().then_some(self.text_input_state.as_ref()).flatten()
         {
@@ -158,10 +182,11 @@ impl SeatHandler for WinitState {
             },
         };
 
-        if let Some(text_input) = seat_state.text_input.take() {
-            text_input.destroy();
-        }
-
+        // PdfCraft patch: the text input belongs to the seat, not to a capability, so it is
+        // destroyed in `remove_seat` instead (rust-windowing/winit#4747). Destroying it here
+        // whenever any capability went away (a touch screen or tablet unplugged, a remote-desktop
+        // session ending) left the window without IME until restart: `new_capability` only
+        // recreates it when a capability is added.
         match capability {
             SeatCapability::Touch => {
                 if let Some(touch) = seat_state.touch.take() {
@@ -192,6 +217,11 @@ impl SeatHandler for WinitState {
                 }
             },
             SeatCapability::Keyboard => {
+                self.clipboard.lock().unwrap_or_else(std::sync::PoisonError::into_inner).focus(
+                    &seat.id(),
+                    false,
+                    0,
+                );
                 seat_state.keyboard_state = None;
                 self.on_keyboard_destroy(&seat.id());
             },
@@ -205,7 +235,10 @@ impl SeatHandler for WinitState {
         _queue_handle: &QueueHandle<Self>,
         seat: WlSeat,
     ) {
-        self.seats.insert(seat.id(), WinitSeatState::new());
+        let mut state = WinitSeatState::new();
+        state.tablet_seat =
+            self.tablet_manager.as_ref().map(|manager| manager.seat(&seat, _queue_handle));
+        self.seats.insert(seat.id(), state);
     }
 
     fn remove_seat(
@@ -214,7 +247,25 @@ impl SeatHandler for WinitState {
         _queue_handle: &QueueHandle<Self>,
         seat: WlSeat,
     ) {
-        let _ = self.seats.remove(&seat.id());
+        self.clipboard.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&seat.id());
+        self.remove_tablet_seat(&seat);
+        if let Some(mut seat_state) = self.seats.remove(&seat.id()) {
+            if let Some(tablet_seat) = seat_state.tablet_seat.take() {
+                if let Some(data) = tablet_seat.data::<tablet::SeatData>() {
+                    data.destroy_objects();
+                }
+                tablet_seat.destroy();
+            }
+            if let Some(device) = seat_state.data_device.take() {
+                self.dnd_remove_device(&device);
+                if device.is_alive() && device.version() >= 2 {
+                    device.release();
+                }
+            }
+            if let Some(text_input) = seat_state.text_input.take() {
+                text_input.destroy();
+            }
+        }
         self.on_keyboard_destroy(&seat.id());
     }
 }
@@ -225,6 +276,9 @@ impl WinitState {
             let mut window = window.lock().unwrap();
             let had_focus = window.has_focus();
             window.remove_seat_focus(seat);
+            if !window.has_focus() {
+                window.caps_lock = None;
+            }
             if had_focus != window.has_focus() {
                 self.events_sink.push_window_event(WindowEvent::Focused(false), *window_id);
             }

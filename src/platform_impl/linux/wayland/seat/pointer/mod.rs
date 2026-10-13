@@ -155,6 +155,10 @@ impl PointerHandler for WinitState {
                 },
                 ref kind @ PointerEventKind::Press { button, serial, .. }
                 | ref kind @ PointerEventKind::Release { button, serial, .. } => {
+                    self.clipboard
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .input(&seat.id(), serial);
                     // Update the last button serial.
                     pointer.winit_data().inner.lock().unwrap().latest_button_serial = serial;
 

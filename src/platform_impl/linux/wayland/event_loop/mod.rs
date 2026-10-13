@@ -473,8 +473,25 @@ impl<T: 'static> EventLoop<T> {
 
         for window_id in window_ids.iter() {
             let event = self.with_state(|state| {
+                let completed = std::mem::take(
+                    &mut *state
+                        .window_requests
+                        .get_mut()
+                        .get(window_id)
+                        .unwrap()
+                        .file_transfer_completed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                );
+                for id in completed {
+                    state.dnd_complete_portal(*window_id, id);
+                }
+                let closed = state.window_requests.get_mut().get(window_id).unwrap().take_closed();
+                if closed {
+                    state.dnd_remove_window(*window_id);
+                }
                 let window_requests = state.window_requests.get_mut();
-                if window_requests.get(window_id).unwrap().take_closed() {
+                if closed {
                     mem::drop(window_requests.remove(window_id));
                     mem::drop(state.windows.get_mut().remove(window_id));
                     return Some(WindowEvent::Destroyed);
@@ -584,8 +601,16 @@ impl<T: 'static> EventLoop<T> {
 
         self.event_loop.dispatch(timeout, state).map_err(|error| {
             tracing::error!("Error dispatching event loop: {}", error);
-            error.into()
-        })
+            std::io::Error::from(error)
+        })?;
+        // Another queue can read the shared display and consume the socket readiness. Its
+        // wakeup must also dispatch our queued callbacks (including pending frame callbacks).
+        let dispatched =
+            self.wayland_dispatcher.as_source_mut().queue().dispatch_pending(state).map_err(
+                |error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()),
+            )?;
+        state.dispatched_events |= dispatched != 0;
+        Ok(())
     }
 
     fn roundtrip(&mut self) -> Result<usize, RootOsError> {
