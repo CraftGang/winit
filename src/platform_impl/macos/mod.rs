@@ -3,6 +3,7 @@ mod util;
 
 mod app;
 mod app_state;
+mod command_key;
 mod cursor;
 mod event;
 mod event_handler;

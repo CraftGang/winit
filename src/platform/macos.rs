@@ -87,7 +87,9 @@ use std::os::raw::c_void;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+use crate::event::KeyEvent;
 use crate::event_loop::{ActiveEventLoop, EventLoopBuilder};
+use crate::keyboard::Key;
 use crate::monitor::MonitorHandle;
 use crate::window::{Window, WindowAttributes};
 
@@ -528,6 +530,31 @@ impl ActiveEventLoopExtMacOS for ActiveEventLoop {
 
     fn allows_automatic_window_tabbing(&self) -> bool {
         self.p.allows_automatic_window_tabbing()
+    }
+}
+
+/// Additional methods on [`KeyEvent`] that are specific to macOS.
+pub trait KeyEventExtMacOS {
+    /// The key's character in the keyboard layout's table for <kbd>⌘</kbd>, ignoring all
+    /// modifiers.
+    ///
+    /// Layouts can type other characters while <kbd>⌘</kbd> is held: "Dvorak – QWERTY ⌘" types
+    /// Dvorak letters but QWERTY ones with <kbd>⌘</kbd>, and non-Latin layouts can give Latin
+    /// letters. While <kbd>⌘</kbd> is held, [`KeyEvent::logical_key`] comes from this table
+    /// (heeding <kbd>Shift</kbd>); this reports it for any key event, for matching shortcuts
+    /// without <kbd>⌘</kbd> or showing them.
+    ///
+    /// Like [`key_without_modifiers`], this is never `Dead`. Keys without a character in the
+    /// table report [`key_without_modifiers`].
+    ///
+    /// [`key_without_modifiers`]: crate::platform::modifier_supplement::KeyEventExtModifierSupplement::key_without_modifiers
+    fn key_with_command(&self) -> Key;
+}
+
+impl KeyEventExtMacOS for KeyEvent {
+    #[inline]
+    fn key_with_command(&self) -> Key {
+        self.platform_specific.key_with_command.clone()
     }
 }
 
