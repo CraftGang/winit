@@ -15,7 +15,6 @@ use objc2_foundation::{
     NSMutableAttributedString, NSNotFound, NSNotificationCenter, NSObject, NSObjectProtocol,
     NSPoint, NSRange, NSRect, NSSize, NSString, NSUInteger,
 };
-use smol_str::SmolStr;
 
 use super::app_state::ApplicationDelegate;
 use super::cursor::{default_cursor, invisible_cursor};
@@ -33,7 +32,7 @@ use crate::event::{
     WindowEvent,
 };
 use crate::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey};
-use crate::platform::macos::OptionAsAlt;
+use crate::platform::macos::{ImeDeleteSurrounding, OptionAsAlt};
 
 #[derive(Debug)]
 struct CursorState {
@@ -152,6 +151,9 @@ pub struct ViewState {
 
     /// The text input methods see around the caret.
     ime_document: RefCell<ImeDocument>,
+
+    /// The deletion that goes with the `Ime::Commit` being handled by the app.
+    ime_delete_surrounding: Cell<Option<ImeDeleteSurrounding>>,
 
     marked_text: RefCell<Retained<NSMutableAttributedString>>,
     /// The selection within `marked_text`, in UTF-16 units.
@@ -309,7 +311,7 @@ declare_class!(
             self.ivars().key_interpreted.set(true);
             self.ivars().ime_startup.borrow_mut().other_callback();
             // Press-and-hold marks the letter just typed while it shows the accent menu.
-            self.delete_replaced(replacement_range);
+            let delete = self.replaced(replacement_range);
 
             // SAFETY: This method is guaranteed to get either a `NSString` or a `NSAttributedString`.
             let (marked_text, string) = if string.is_kind_of::<NSAttributedString>() {
@@ -337,6 +339,9 @@ declare_class!(
             if self.ivars().ime_state.get() == ImeState::Disabled {
                 *self.ivars().input_source.borrow_mut() = self.current_input_source();
                 self.queue_event(WindowEvent::Ime(Ime::Enabled));
+            }
+            if delete.is_some() {
+                self.queue_commit(String::new(), delete);
             }
 
             if unsafe { self.hasMarkedText() } {
@@ -477,7 +482,7 @@ declare_class!(
                 self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
             }
             // Press-and-hold and dictation replace text they inserted before.
-            self.delete_replaced(replacement_range);
+            let mut delete = self.replaced(replacement_range);
 
             // Only commit via IME if there was a real composition session.
             // Some IMEs send insertText for all typing (e.g. spaces, English chars)
@@ -485,7 +490,7 @@ declare_class!(
             if pending_commit && ime_enabled && !is_control {
                 self.ivars().pending_commit.set(false);
                 self.ivars().ime_document.borrow_mut().insert(&string);
-                self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
+                self.queue_commit(string, delete.take());
                 // WordCraft patch: input methods also commit outside a key press (a candidate
                 // clicked with the mouse, dictation), where no key follows to clear the marked text
                 // and reset the state: the next key would be swallowed
@@ -509,21 +514,25 @@ declare_class!(
                 // menu with a digit.
                 let key_characters = self.ivars().key_characters.borrow().clone();
                 match plain_insert(&string, key_characters.as_deref()) {
-                    PlainInsert::KeyText => self.ivars().ime_document.borrow_mut().insert(&string),
-                    PlainInsert::Commit if self.ivars().ime_allowed.get() => {
-                        if self.ivars().ime_state.get() == ImeState::Disabled {
-                            *self.ivars().input_source.borrow_mut() = self.current_input_source();
-                            self.ivars().ime_state.set(ImeState::Ground);
-                            self.queue_event(WindowEvent::Ime(Ime::Enabled));
+                    PlainInsert::KeyText => {
+                        // The deletion goes before the key's `KeyboardInput`, which `keyDown:`
+                        // sends after this returns.
+                        if delete.is_some() && self.ivars().ime_allowed.get() {
+                            self.notify_ime_enabled();
+                            self.queue_commit(String::new(), delete.take());
                         }
+                        self.ivars().ime_document.borrow_mut().insert(&string)
+                    },
+                    PlainInsert::Commit if self.ivars().ime_allowed.get() => {
+                        self.notify_ime_enabled();
                         if self.ivars().in_key_down.get() {
                             // `keyDown:` doesn't send the key's own text.
                             self.ivars().committed_in_key_down.set(true);
                         }
                         self.ivars().ime_document.borrow_mut().insert(&string);
-                        self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
-                    }
-                    PlainInsert::Commit | PlainInsert::Ignore => {}
+                        self.queue_commit(string, delete.take());
+                    },
+                    PlainInsert::Commit | PlainInsert::Ignore => {},
                 }
             }
         }
@@ -993,6 +1002,7 @@ impl WinitView {
             key_interpreted: Default::default(),
             key_characters: Default::default(),
             ime_document: Default::default(),
+            ime_delete_surrounding: Default::default(),
             marked_text: Default::default(),
             marked_selection: Default::default(),
             accepts_first_mouse,
@@ -1059,21 +1069,47 @@ impl WinitView {
             .unwrap_or_default()
     }
 
-    /// Delete the text an input method replaces with Backspace presses, which toolkits already
-    /// handle (Linux input methods without surrounding text do the same).
-    fn delete_replaced(&self, range: NSRange) {
+    /// Tell the app IME is active if it doesn't know yet.
+    fn notify_ime_enabled(&self) {
+        if self.ivars().ime_state.get() == ImeState::Disabled {
+            *self.ivars().input_source.borrow_mut() = self.current_input_source();
+            self.ivars().ime_state.set(ImeState::Ground);
+            self.queue_event(WindowEvent::Ime(Ime::Enabled));
+        }
+    }
+
+    /// Forget the text an input method replaces, and return what the app has to delete.
+    fn replaced(&self, range: NSRange) -> Option<ImeDeleteSurrounding> {
         let range =
             (range.location != NSNotFound as NSUInteger).then_some((range.location, range.length));
-        let replaced = self.ivars().ime_document.borrow_mut().replace(range);
-        for _ in replaced.chars() {
-            for state in [ElementState::Pressed, ElementState::Released] {
-                self.queue_event(WindowEvent::KeyboardInput {
-                    device_id: DEVICE_ID,
-                    event: backspace_event(state),
-                    is_synthetic: false,
-                });
-            }
-        }
+        self.ivars().ime_document.borrow_mut().replace(range)
+    }
+
+    /// Queue `Ime::Commit(text)`. While the app handles it, `take_ime_delete_surrounding` returns
+    /// `delete`.
+    ///
+    /// The deletion is an exact byte count rather than Backspace presses: toolkits delete a whole
+    /// grapheme cluster (an emoji sequence, a letter and its combining accents) per Backspace.
+    fn queue_commit(&self, text: String, delete: Option<ImeDeleteSurrounding>) {
+        let event = WindowEvent::Ime(Ime::Commit(text));
+        let Some(delete) = delete else {
+            return self.queue_event(event);
+        };
+        let Some(window) = self.ivars()._ns_window.load() else {
+            tracing::debug!("dropping {event:?} for a window that is gone");
+            return;
+        };
+        let window_id = window.id();
+        let view = self.retain();
+        self.ivars().app_delegate.maybe_queue_handler(move |app_delegate| {
+            view.ivars().ime_delete_surrounding.set(Some(delete));
+            app_delegate.handle_window_event(window_id, event);
+            view.ivars().ime_delete_surrounding.set(None);
+        });
+    }
+
+    pub(super) fn take_ime_delete_surrounding(&self) -> Option<ImeDeleteSurrounding> {
+        self.ivars().ime_delete_surrounding.take()
     }
 
     pub(super) fn cursor_icon(&self) -> Retained<NSCursor> {
@@ -1346,24 +1382,6 @@ impl WinitView {
             device_id: DEVICE_ID,
             position: view_point.to_physical(self.scale_factor()),
         });
-    }
-}
-
-/// A Backspace press or release that no key made.
-fn backspace_event(state: ElementState) -> KeyEvent {
-    let key = Key::Named(NamedKey::Backspace);
-    KeyEvent {
-        physical_key: KeyCode::Backspace.into(),
-        text: (state == ElementState::Pressed).then(|| key.to_text().map(SmolStr::new)).flatten(),
-        logical_key: key.clone(),
-        location: KeyLocation::Standard,
-        state,
-        repeat: false,
-        platform_specific: KeyEventExtra {
-            text_with_all_modifiers: Some(SmolStr::new("\u{7f}")),
-            key_without_modifiers: key.clone(),
-            key_with_command: key,
-        },
     }
 }
 

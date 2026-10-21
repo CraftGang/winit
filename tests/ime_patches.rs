@@ -241,7 +241,7 @@ fn macos_input_methods_see_a_caret_and_replace_text() {
     // winit 0.30.13 reports no selection, so dictation inserts nothing (rust-windowing/winit#4666),
     // and ignores replacement ranges, so a press-and-hold accent is typed after the letter instead
     // of replacing it (#3617). The view reports a caret after the text typed since it last moved
-    // (`ImeDocument`) and deletes replaced text with Backspace presses.
+    // (`ImeDocument`) and has the app delete replaced text with the commit that replaces it.
     let view = source("macos/view.rs");
     let selected_range = view_method(&view, "fn selected_range(&self) -> NSRange {");
     assert!(selected_range.contains("ime_document"), "selectedRange reports no caret");
@@ -253,10 +253,30 @@ fn macos_input_methods_see_a_caret_and_replace_text() {
     );
     for method in ["fn set_marked_text(", "fn insert_text("] {
         assert!(
-            view_method(&view, method).contains("self.delete_replaced(replacement_range);"),
+            view_method(&view, method).contains("delete = self.replaced(replacement_range);"),
             "{method} ignores its replacement range"
         );
     }
+}
+
+#[test]
+fn macos_replaced_text_is_deleted_by_byte_count() {
+    // Toolkits delete a whole grapheme cluster per Backspace, so one Backspace per replaced
+    // character deleted text before the replaced range after a combining accent, a flag or a ZWJ
+    // emoji. The deletion goes with a commit (`WindowExtMacOS::take_ime_delete_surrounding`), as
+    // on Wayland.
+    let view = source("macos/view.rs");
+    assert!(!view.contains("NamedKey::Backspace"), "replaced text is deleted with Backspace");
+    let queue_commit = section(&view, "fn queue_commit(", "\n    }\n");
+    assert!(
+        queue_commit.contains("view.ivars().ime_delete_surrounding.set(Some(delete));"),
+        "the app can't take the deletion while it handles the commit"
+    );
+    let set_marked_text = view_method(&view, "fn set_marked_text(");
+    assert!(
+        set_marked_text.contains("self.queue_commit(String::new(), delete);"),
+        "a deletion before a preedit isn't delivered"
+    );
 }
 
 #[test]
@@ -325,6 +345,13 @@ mod ime_startup;
 #[allow(dead_code)]
 #[path = "../src/platform_impl/macos/ime_document.rs"]
 mod ime_document;
+
+/// `winit::platform::macos::ImeDeleteSurrounding`, which only macOS builds have.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ImeDeleteSurrounding {
+    pub before_bytes: usize,
+    pub after_bytes: usize,
+}
 
 #[test]
 fn macos_first_apple_korean_key_is_retried_once() {

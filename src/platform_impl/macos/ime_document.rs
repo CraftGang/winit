@@ -9,6 +9,9 @@
 //! Offsets are UTF-16 code units, as in `NSRange`. They keep growing across resets, so a range an
 //! input method computed before a reset never matches text inserted after it.
 
+// `tests/ime_patches.rs` includes this file and provides its own `ImeDeleteSurrounding`.
+use super::ImeDeleteSurrounding;
+
 /// Text kept for replacements, in characters.
 const KEPT_CHARS: usize = 256;
 
@@ -68,21 +71,20 @@ impl ImeDocument {
         Some((text.to_owned(), (from, utf16_len(text))))
     }
 
-    /// Remove the text an input method replaces, and return it: the app has to delete it.
+    /// Remove the text an input method replaces, and return the deletion the app has to make.
     ///
     /// Only a range that reaches the caret is honoured. The part of it after the caret is the
     /// marked text, which the new text replaces anyway. A range that ends before the caret, or
     /// starts before the known text, would need the app's own text and is ignored.
-    pub fn replace(&mut self, range: Option<(usize, usize)>) -> String {
-        let Some((location, length)) = range else {
-            return String::new();
-        };
+    pub fn replace(&mut self, range: Option<(usize, usize)>) -> Option<ImeDeleteSurrounding> {
+        let (location, length) = range?;
         let caret = self.caret();
         if location >= caret || location < self.start || location.saturating_add(length) < caret {
-            return String::new();
+            return None;
         }
         let from = self.byte_offset(location);
-        self.typed.split_off(from)
+        let replaced = self.typed.split_off(from);
+        Some(ImeDeleteSurrounding { before_bytes: replaced.len(), after_bytes: 0 })
     }
 
     /// The byte offset in `typed` of a document offset, moved back to a character boundary.
@@ -138,12 +140,17 @@ mod tests {
         document
     }
 
+    /// The deletion of `text` before the caret.
+    fn deleting(text: &str) -> Option<ImeDeleteSurrounding> {
+        Some(ImeDeleteSurrounding { before_bytes: text.len(), after_bytes: 0 })
+    }
+
     #[test]
     fn press_and_hold_replaces_the_letter_before_the_caret() {
         let mut document = typed("café");
         assert_eq!(document.selected_range(None), (4, 0));
         assert_eq!(document.substring((3, 1)), Some(("é".to_owned(), (3, 1))));
-        assert_eq!(document.replace(Some((3, 1))), "é");
+        assert_eq!(document.replace(Some((3, 1))), deleting("é"));
         document.insert("è");
         assert_eq!(document.substring((0, 10)), Some(("cafè".to_owned(), (0, 4))));
     }
@@ -152,7 +159,7 @@ mod tests {
     fn a_range_into_the_marked_text_replaces_up_to_the_caret() {
         let mut document = typed("e");
         assert_eq!(document.selected_range(Some((1, 0))), (2, 0));
-        assert_eq!(document.replace(Some((0, 2))), "e");
+        assert_eq!(document.replace(Some((0, 2))), deleting("e"));
         assert_eq!(document.caret(), 0);
     }
 
@@ -160,14 +167,14 @@ mod tests {
     fn ranges_the_document_cannot_answer_are_ignored() {
         let mut document = typed("abc");
         for range in [None, Some((3, 0)), Some((3, 2)), Some((0, 1)), Some((1, 1))] {
-            assert_eq!(document.replace(range), "", "{range:?}");
+            assert_eq!(document.replace(range), None, "{range:?}");
         }
         document.reset();
         document.insert("x");
         // A range from before the reset.
-        assert_eq!(document.replace(Some((2, 1))), "");
+        assert_eq!(document.replace(Some((2, 1))), None);
         assert_eq!(document.substring((0, 3)), None);
-        assert_eq!(document.replace(Some((3, 1))), "x");
+        assert_eq!(document.replace(Some((3, 1))), deleting("x"));
     }
 
     #[test]
@@ -175,7 +182,7 @@ mod tests {
         let mut document = typed("a😀b");
         assert_eq!(document.caret(), 4);
         // A range starting inside the surrogate pair takes the whole character.
-        assert_eq!(document.replace(Some((2, 2))), "😀b");
+        assert_eq!(document.replace(Some((2, 2))), deleting("😀b"));
         assert_eq!(document.caret(), 1);
     }
 
@@ -185,7 +192,36 @@ mod tests {
         document.insert("bc");
         assert_eq!(document.caret(), KEPT_CHARS + 2);
         assert_eq!(document.substring((0, 2)), None);
-        assert_eq!(document.replace(Some((KEPT_CHARS, 2))), "bc");
+        assert_eq!(document.replace(Some((KEPT_CHARS, 2))), deleting("bc"));
+    }
+
+    #[test]
+    fn replacements_delete_exact_bytes_after_accents_flags_and_emoji_sequences() {
+        // Toolkits delete a whole grapheme cluster per Backspace, so the deletion is an exact
+        // byte count: the text before the replaced range must survive.
+        let prefix = "e\u{301}é🇯🇵👨\u{200d}👩\u{200d}👧";
+        let prefix_units = utf16_len(prefix);
+        assert_eq!(prefix_units, 2 + 1 + 4 + 8);
+
+        // Press-and-hold replaces the letter after the ZWJ sequence.
+        let mut document = typed(&format!("{prefix}e"));
+        let deletion = document.replace(Some((prefix_units, 1)));
+        assert_eq!(deletion, Some(ImeDeleteSurrounding { before_bytes: 1, after_bytes: 0 }));
+        assert_eq!(document.substring((0, 100)), Some((prefix.to_owned(), (0, prefix_units))));
+
+        // Replacing the emoji sequence itself: 18 bytes, 8 UTF-16 units.
+        let mut document = typed(prefix);
+        let deletion = document.replace(Some((7, 8)));
+        assert_eq!(deletion, Some(ImeDeleteSurrounding { before_bytes: 18, after_bytes: 0 }));
+        assert_eq!(document.substring((0, 100)), Some(("e\u{301}é🇯🇵".to_owned(), (0, 7))));
+
+        // One regional indicator of the flag, and the combining accent without its letter.
+        let mut document = typed("a🇯🇵");
+        assert_eq!(document.replace(Some((3, 2))), deleting("🇵"));
+        assert_eq!(document.substring((0, 10)), Some(("a🇯".to_owned(), (0, 3))));
+        let mut document = typed("e\u{301}");
+        assert_eq!(document.replace(Some((1, 1))), deleting("\u{301}"));
+        assert_eq!(document.substring((0, 10)), Some(("e".to_owned(), (0, 1))));
     }
 
     #[test]
