@@ -230,3 +230,20 @@ fn windows_system_caret_follows_the_ime_cursor_area() {
         );
     }
 }
+
+#[test]
+fn windows_keys_taken_by_the_ime_are_not_sent() {
+    // While an IME uses a key, `WM_KEYDOWN` carries `VK_PROCESSKEY`. winit 0.30.13 sent it as a
+    // `Process` key press with the key's physical code, which apps that fall back to the physical
+    // key (egui-winit) took as that key: Backspace or Enter in a composition also acted in the
+    // app. Such a key-down is dropped unless the IME passes text on with it.
+    let keyboard = source("windows/keyboard.rs");
+    let key_down = section(&keyboard, "WM_KEYDOWN | WM_SYSKEYDOWN => {", "WM_DEADCHAR");
+    assert!(
+        key_down.contains(
+            "if event_info.vkey == VK_PROCESSKEY {\n                            return \
+             MatchResult::TokenToRemove(pending_token);"
+        ),
+        "a key the IME took is sent as a key press"
+    );
+}
