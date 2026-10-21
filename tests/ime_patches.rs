@@ -55,26 +55,30 @@ fn windows_ime_cursor_is_read_only_when_reported() {
 }
 
 #[test]
-fn x11_replaced_input_context_is_focused() {
+fn x11_input_context_outlives_disallowing_ime() {
     // Toolkits allow IME when a text field gains focus and disallow it when the field loses it
-    // (egui does). winit 0.30.13 replaces the window's input context each time and leaves focusing
-    // the new one to the next focus event, which never comes while the window keeps the focus, so
-    // the input method doesn't follow the field. The replacement is focused once the queued
-    // requests are handled (rust-windowing/winit#4727).
+    // (egui does). winit 0.30.13 destroys the window's input context each time and creates a new
+    // one, which resets the input method's state for the window (Vietnamese Telex turns off) and
+    // stays unfocused until the next focus event, which never comes while the window keeps the
+    // focus. The window keeps one context: allowing IME focuses it, disallowing resets and
+    // unfocuses it. This also covers rust-windowing/winit#4727.
     let ime = source("linux/x11/ime/mod.rs");
+    let set_ime_allowed = section(&ime, "pub fn set_ime_allowed(", "\n    }\n");
     assert!(
-        ime.contains("allowed: bool,\n    ) -> Result<bool, ImeContextCreationError> {"),
-        "set_ime_allowed doesn't say whether it replaced the context"
+        !set_ime_allowed.contains("remove_context"),
+        "set_ime_allowed destroys the input context"
+    );
+    let context = source("linux/x11/ime/context.rs");
+    assert!(
+        !context.contains("none_style"),
+        "a context with IME disallowed is created with another input style"
     );
     let events = source("linux/x11/event_processor.rs");
-    assert!(
-        events.contains("Ok(true) => ime_focus = Some(window_id),"),
-        "a replaced input context isn't remembered for focusing"
-    );
-    assert!(
-        events.contains("let _ = ime.get_mut().focus(window_id);"),
-        "a replaced input context isn't focused"
-    );
+    let allow =
+        section(&events, "ImeRequest::Allow(window_id, allowed) => {", "\n                },\n");
+    for call in ["ime.focus(window_id)", "ime.reset(window_id)", "ime.unfocus(window_id)"] {
+        assert!(allow.contains(call), "an IME allow request doesn't call `{call}`");
+    }
 }
 
 /// A method in `WinitView`'s `define_class!` block.
@@ -137,7 +141,8 @@ fn macos_text_inserted_outside_a_key_press_is_committed() {
     let insert_text = view_method(&view, "fn insert_text(");
     assert!(
         insert_text.contains(
-            "} else if !self.ivars().in_key_down.get()\n                && self.ivars().ime_allowed.get()"
+            "} else if !self.ivars().in_key_down.get()\n                && \
+             self.ivars().ime_allowed.get()"
         ),
         "text inserted outside a key press is dropped"
     );
@@ -164,7 +169,8 @@ fn macos_key_committed_through_ime_is_sent_once() {
     let key_down = view_method(&view, "fn key_down(");
     assert!(
         key_down.contains(
-            "let had_ime_input = self.ivars().committed_in_key_down.replace(false) || had_ime_input;"
+            "let had_ime_input = self.ivars().committed_in_key_down.replace(false) || \
+             had_ime_input;"
         ),
         "a key committed through IME is sent again as KeyboardInput"
     );

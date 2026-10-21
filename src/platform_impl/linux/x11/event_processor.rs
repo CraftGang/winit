@@ -84,7 +84,6 @@ impl EventProcessor {
         let window_target = Self::window_target_mut(&mut self.target);
 
         // Handle IME requests.
-        let mut ime_focus = None;
         while let Ok(request) = self.ime_receiver.try_recv() {
             let ime = match window_target.ime.as_mut() {
                 Some(ime) => ime,
@@ -95,25 +94,21 @@ impl EventProcessor {
                 ImeRequest::Position(window_id, x, y) => {
                     ime.send_xim_spot(window_id, x, y);
                 },
+                // Toolkits allow IME when a text field gains focus and disallow it when the field
+                // loses it, while the window keeps the focus, so no focus event follows. The
+                // context is focused here, or reset and unfocused so the input method drops the
+                // composition and its candidate window.
                 ImeRequest::Allow(window_id, allowed) => {
-                    let result = ime.set_ime_allowed(window_id, allowed);
-                    if self.active_window == Some(window_id as xproto::Window) {
-                        match result {
-                            Ok(true) => ime_focus = Some(window_id),
-                            Err(_) => ime_focus = None,
-                            Ok(false) => {},
+                    if let Ok(true) = ime.set_ime_allowed(window_id, allowed) {
+                        if !allowed {
+                            let _ = ime.reset(window_id);
+                            let _ = ime.unfocus(window_id);
+                        } else if self.active_window == Some(window_id as xproto::Window) {
+                            let _ = ime.focus(window_id);
                         }
                     }
                 },
             }
-        }
-
-        // WordCraft patch: replacing the focused window's input context (egui allows IME whenever a
-        // text field gains focus and disallows it when it loses focus) generates no focus event, so
-        // the new context stayed unfocused until the window lost and regained focus. Focus the last
-        // context replaced in this batch, once (rust-windowing/winit#4727).
-        if let (Some(window_id), Some(ime)) = (ime_focus, window_target.ime.as_mut()) {
-            let _ = ime.get_mut().focus(window_id);
         }
 
         // Drain IME events.
