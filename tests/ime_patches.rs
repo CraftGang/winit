@@ -81,6 +81,31 @@ fn x11_input_context_outlives_disallowing_ime() {
     }
 }
 
+#[test]
+fn x11_ime_spot_waits_for_the_input_method() {
+    // Setting the IME spot is a synchronous XIM request. Keys an input method forwards back while
+    // the client waits for the reply are filtered again by Xlib and reach the input method as new
+    // key presses; Vietnamese engines that fix words with forwarded BackSpaces garble the text
+    // (rust-windowing/winit#4777, storytold/wordcraft#2932). Spots are queued and sent once no
+    // event is queued and the input method has been quiet for a while.
+    let events = source("linux/x11/event_processor.rs");
+    let position = section(&events, "ImeRequest::Position(window_id, x, y) => {", "},");
+    assert!(!position.contains("send_xim_spot"), "an IME spot is sent as soon as it's requested");
+    let send = section(&events, "pub fn send_ime_spots(&mut self) {", "\n    }\n");
+    assert!(send.contains("self.ime_busy_until"), "IME spots don't wait for the input method");
+    assert!(send.contains("self.poll()"), "IME spots are sent while events are queued");
+    let filtered = section(&events, "// Don't process event if it was filtered.", "return;");
+    assert!(
+        filtered.contains("self.ime_busy_until = Some("),
+        "events taken by the input method don't hold IME spots back"
+    );
+    let event_loop = source("linux/x11/mod.rs");
+    assert!(
+        event_loop.contains("self.event_processor.send_ime_spots();"),
+        "the event loop doesn't send IME spots held back"
+    );
+}
+
 /// A method in `WinitView`'s `define_class!` block.
 fn view_method<'a>(view: &'a str, signature: &str) -> &'a str {
     section(view, signature, "\n        }\n")

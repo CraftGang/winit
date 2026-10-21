@@ -3,6 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use std::os::raw::{c_char, c_int, c_long, c_ulong};
 use std::slice;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use x11_dl::xinput2::{
     self, XIDeviceEvent, XIEnterEvent, XIFocusInEvent, XIFocusOutEvent, XIHierarchyEvent,
@@ -72,9 +73,54 @@ pub struct EventProcessor {
     pub xfiltered_modifiers: VecDeque<u8>,
     pub xmodmap: util::ModifierKeymap,
     pub is_composing: bool,
+    /// The latest IME spot requested for each window, not yet sent to the input method.
+    pub ime_spots: HashMap<XWindow, (i16, i16)>,
+    /// Until when the input method may still be answering the keys it was given.
+    pub ime_busy_until: Option<Instant>,
 }
 
+/// How long after its last message an input method is taken to have finished answering a key.
+const IME_SETTLE_TIME: Duration = Duration::from_millis(100);
+
 impl EventProcessor {
+    /// Sends the queued IME spots once the input method has gone quiet.
+    ///
+    /// Setting the spot is a synchronous XIM request. Xlib handles the keys an input method
+    /// forwards back while it waits for the reply, puts them back on the event queue in reverse
+    /// order and marks only the last one as forwarded, so the rest are filtered again: the input
+    /// method gets its own keys back as new key presses, and the app gets them after the text
+    /// committed with them. Vietnamese engines that fix a word by forwarding BackSpaces and
+    /// committing the new tail garble the text this way (rust-windowing/winit#4777). Input
+    /// methods only send keys back in answer to keys this thread gave them, so the request is
+    /// safe once no event is queued and no input method message has arrived for a while.
+    pub fn send_ime_spots(&mut self) {
+        if self.ime_spots.is_empty()
+            || self.ime_busy_until.is_some_and(|until| Instant::now() < until)
+            || self.poll()
+        {
+            return;
+        }
+        self.ime_busy_until = None;
+        let window_target = Self::window_target_mut(&mut self.target);
+        if let Some(ime) = window_target.ime.as_mut() {
+            let ime = ime.get_mut();
+            for (window_id, (x, y)) in self.ime_spots.drain() {
+                ime.send_xim_spot(window_id, x, y);
+            }
+        } else {
+            self.ime_spots.clear();
+        }
+    }
+
+    /// When the event loop has to wake up to send the queued IME spots.
+    pub fn ime_spots_deadline(&self) -> Option<Instant> {
+        if self.ime_spots.is_empty() {
+            None
+        } else {
+            Some(self.ime_busy_until.unwrap_or_else(Instant::now))
+        }
+    }
+
     pub fn process_event<T: 'static, F>(&mut self, xev: &mut XEvent, mut callback: F)
     where
         F: FnMut(&RootAEL, Event<T>),
@@ -92,7 +138,7 @@ impl EventProcessor {
             let ime = ime.get_mut();
             match request {
                 ImeRequest::Position(window_id, x, y) => {
-                    ime.send_xim_spot(window_id, x, y);
+                    self.ime_spots.insert(window_id, (x, y));
                 },
                 // Toolkits allow IME when a text field gains focus and disallow it when the field
                 // loses it, while the window keeps the focus, so no focus event follows. The
@@ -110,6 +156,7 @@ impl EventProcessor {
                 },
             }
         }
+        self.send_ime_spots();
 
         // Drain IME events.
         while let Ok((window, event)) = self.ime_event_receiver.try_recv() {
@@ -192,6 +239,7 @@ impl EventProcessor {
 
         // Don't process event if it was filtered.
         if filtered {
+            self.ime_busy_until = Some(Instant::now() + IME_SETTLE_TIME);
             return;
         }
 
