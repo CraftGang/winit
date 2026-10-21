@@ -640,6 +640,8 @@ impl Window {
 pub struct KeyEventExtra {
     pub text_with_all_modifiers: Option<SmolStr>,
     pub key_without_modifiers: Key,
+    pub latin_key: Option<Key>,
+    pub is_latin_layout: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
