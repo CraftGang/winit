@@ -195,3 +195,38 @@ fn macos_first_apple_korean_key_is_retried_once() {
         "insertText doesn't report to the retry policy"
     );
 }
+
+// `SystemCaret` is plain Rust, so its policy tests run on every platform.
+#[allow(dead_code)]
+#[path = "../src/platform_impl/windows/ime_caret.rs"]
+mod ime_caret;
+
+#[test]
+fn windows_system_caret_follows_the_ime_cursor_area() {
+    // Some IMEs place their windows at the system caret and ignore `ImmSetCandidateWindow`
+    // (Sogou, some Japanese IMEs). winit 0.30.13 creates no caret, so they couldn't find the
+    // text being composed. A focused window that allows IME keeps a hidden caret over the IME
+    // cursor area, under the rules `SystemCaret` tests.
+    let window = source("windows/window.rs");
+    let cursor_area = section(&window, "pub fn set_ime_cursor_area(", "\n    }\n");
+    assert!(
+        cursor_area.contains("state.system_caret.set_area(")
+            && cursor_area.contains("ImeContext::update_system_caret(window, caret);"),
+        "the caret doesn't follow the IME cursor area"
+    );
+    let allowed = section(&window, "pub fn set_ime_allowed(", "\n    }\n");
+    assert!(
+        allowed.contains("state.system_caret.set_ime_allowed(allowed)")
+            && allowed.contains("ImeContext::update_system_caret(window, caret);"),
+        "allowing IME doesn't create or destroy the caret"
+    );
+    let event_loop = source("windows/event_loop.rs");
+    for (message, focused) in [("WM_SETFOCUS => {", "true"), ("WM_KILLFOCUS => {", "false")] {
+        let handler = section(&event_loop, message, "\n        },\n");
+        assert!(
+            handler.contains(&format!("w.system_caret.set_focused({focused})"))
+                && handler.contains("ImeContext::update_system_caret(window, caret)"),
+            "{message} doesn't update the caret"
+        );
+    }
+}
