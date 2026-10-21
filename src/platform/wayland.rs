@@ -140,15 +140,62 @@ impl<T> EventLoopBuilderExtWayland for EventLoopBuilder<T> {
     }
 }
 
+/// Text an input method asks to delete around the cursor, in bytes of UTF-8 text.
+///
+/// The counts exclude the selection and the preedit: `before_bytes` ends where the preedit or
+/// selection starts and `after_bytes` starts where it ends.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ImeDeleteSurrounding {
+    /// Bytes to delete before the cursor.
+    pub before_bytes: usize,
+    /// Bytes to delete after the cursor.
+    pub after_bytes: usize,
+}
+
 /// Additional methods on [`Window`] that are specific to Wayland.
 ///
 /// [`Window`]: crate::window::Window
 pub trait WindowExtWayland {
     /// Returns `xdg_toplevel` of the window or [`None`] if the window is X11 window.
     fn xdg_toplevel(&self) -> Option<NonNull<c_void>>;
+    /// Tells the input method the text around the cursor of the focused text field, so it can
+    /// base suggestions and corrections on it (text-input-v3 surrounding text).
+    ///
+    /// `cursor` and `anchor` are byte offsets into `text`, the other end of the selection being
+    /// `anchor`; without a selection they are equal. Leave the preedit out of `text`. Offsets
+    /// are clamped to the text and moved back to a character boundary, and text longer than
+    /// 4000 bytes is cut around the cursor and selection. Call it again whenever the text, cursor
+    /// or selection changes. Disallowing IME forgets the text. X11 ignores it.
+    fn set_ime_surrounding_text(&self, text: &str, cursor: usize, anchor: usize);
+    /// The surrounding text to delete before inserting the [`Ime::Commit`] being handled.
+    ///
+    /// Call this when handling each `Ime::Commit`, after removing the preedit and before
+    /// inserting the committed text, which may be empty when an input method only deletes.
+    /// Returns `None` when the commit deletes nothing, and always on X11.
+    ///
+    /// [`Ime::Commit`]: crate::event::Ime::Commit
+    fn take_ime_delete_surrounding(&self) -> Option<ImeDeleteSurrounding>;
 }
 
 impl WindowExtWayland for Window {
+    fn set_ime_surrounding_text(&self, text: &str, cursor: usize, anchor: usize) {
+        match &self.window {
+            #[cfg(x11_platform)]
+            crate::platform_impl::Window::X(_) => {},
+            #[cfg(wayland_platform)]
+            crate::platform_impl::Window::Wayland(window) => {
+                window.set_ime_surrounding_text(text, cursor, anchor)
+            },
+        }
+    }
+    fn take_ime_delete_surrounding(&self) -> Option<ImeDeleteSurrounding> {
+        match &self.window {
+            #[cfg(x11_platform)]
+            crate::platform_impl::Window::X(_) => None,
+            #[cfg(wayland_platform)]
+            crate::platform_impl::Window::Wayland(window) => window.take_ime_delete_surrounding(),
+        }
+    }
     #[inline]
     fn xdg_toplevel(&self) -> Option<NonNull<c_void>> {
         #[allow(clippy::single_match)]

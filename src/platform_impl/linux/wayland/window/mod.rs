@@ -626,6 +626,18 @@ impl Window {
     }
 
     #[inline]
+    pub fn set_ime_surrounding_text(&self, text: &str, cursor: usize, anchor: usize) {
+        self.window_state.lock().unwrap().set_ime_surrounding_text(text, cursor, anchor);
+    }
+
+    #[inline]
+    pub fn take_ime_delete_surrounding(
+        &self,
+    ) -> Option<crate::platform::wayland::ImeDeleteSurrounding> {
+        self.window_state.lock().unwrap().ime_delete_surrounding.take()
+    }
+
+    #[inline]
     pub fn reset_ime(&self) {
         let window_state = self.window_state.lock().unwrap();
         if window_state.ime_allowed() && window_state.reset_ime() {

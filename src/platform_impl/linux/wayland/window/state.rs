@@ -39,8 +39,10 @@ use crate::platform_impl::wayland::types::kwin_blur::KWinBlurManager;
 use crate::platform_impl::{PlatformCustomCursor, WindowId};
 use crate::window::{CursorGrabMode, CursorIcon, ImePurpose, ResizeDirection, Theme};
 
+use crate::platform::wayland::ImeDeleteSurrounding;
 use crate::platform_impl::wayland::seat::{
-    PointerConstraintsState, WinitPointerData, WinitPointerDataExt, ZwpTextInputV3Ext,
+    surrounding_text_excerpt, PointerConstraintsState, WinitPointerData, WinitPointerDataExt,
+    ZwpTextInputV3Ext,
 };
 use crate::platform_impl::wayland::state::{WindowCompositorUpdate, WinitState};
 
@@ -114,6 +116,12 @@ pub struct WindowState {
 
     /// The last IME cursor area, as `x, y, width, height`.
     ime_cursor_area: Option<(i32, i32, i32, i32)>,
+
+    /// The last surrounding text, trimmed, with the cursor and anchor offsets in it.
+    ime_surrounding_text: Option<(String, i32, i32)>,
+
+    /// The deletion that goes with the `Ime::Commit` being delivered.
+    pub ime_delete_surrounding: Option<ImeDeleteSurrounding>,
 
     /// The text inputs observed on the window.
     text_inputs: Vec<ZwpTextInputV3>,
@@ -204,6 +212,8 @@ impl WindowState {
             ime_allowed: false,
             ime_purpose: ImePurpose::Normal,
             ime_cursor_area: None,
+            ime_surrounding_text: None,
+            ime_delete_surrounding: None,
             last_configure: None,
             max_inner_size: None,
             min_inner_size: MIN_WINDOW_SIZE,
@@ -1022,13 +1032,16 @@ impl WindowState {
     /// Returns `true` if the requested state was applied.
     pub fn set_ime_allowed(&mut self, allowed: bool) -> bool {
         self.ime_allowed = allowed;
+        if !allowed {
+            self.ime_surrounding_text = None;
+        }
 
         let mut applied = false;
         for text_input in &self.text_inputs {
             applied = true;
             if allowed {
                 text_input.enable();
-                text_input.set_content_type_by_purpose(self.ime_purpose);
+                self.apply_ime_state(text_input);
             } else {
                 text_input.disable();
             }
@@ -1036,6 +1049,30 @@ impl WindowState {
         }
 
         applied
+    }
+
+    /// Sends the state that enabling a text input resets, without committing it.
+    pub fn apply_ime_state(&self, text_input: &ZwpTextInputV3) {
+        text_input.set_content_type_by_purpose(self.ime_purpose);
+        if let Some((x, y, width, height)) = self.ime_cursor_area {
+            text_input.set_cursor_rectangle(x, y, width, height);
+        }
+        if let Some((text, cursor, anchor)) = &self.ime_surrounding_text {
+            text_input.set_surrounding_text(text.clone(), *cursor, *anchor);
+        }
+    }
+
+    /// Set the text around the IME cursor.
+    pub fn set_ime_surrounding_text(&mut self, text: &str, cursor: usize, anchor: usize) {
+        let (text, cursor, anchor) = surrounding_text_excerpt(text, cursor, anchor);
+        let (cursor, anchor) = (cursor as i32, anchor as i32);
+        if self.ime_allowed {
+            for text_input in &self.text_inputs {
+                text_input.set_surrounding_text(text.to_owned(), cursor, anchor);
+                text_input.commit();
+            }
+        }
+        self.ime_surrounding_text = Some((text.to_owned(), cursor, anchor));
     }
 
     /// Set the IME position.
@@ -1062,10 +1099,7 @@ impl WindowState {
             text_input.disable();
             text_input.commit();
             text_input.enable();
-            text_input.set_content_type_by_purpose(self.ime_purpose);
-            if let Some((x, y, width, height)) = self.ime_cursor_area {
-                text_input.set_cursor_rectangle(x, y, width, height);
-            }
+            self.apply_ime_state(text_input);
             text_input.commit();
             preedit_shown |= text_input.take_preedit();
         }

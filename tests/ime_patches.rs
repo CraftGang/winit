@@ -138,9 +138,36 @@ fn linux_reset_ime_discards_the_composition() {
         reset[disable..enable].contains("text_input.commit();"),
         "Wayland reset doesn't commit between disabling and enabling"
     );
-    for request in ["set_content_type_by_purpose", "set_cursor_rectangle"] {
-        assert!(reset[enable..].contains(request), "Wayland reset doesn't restore `{request}`");
+    assert!(
+        reset[enable..].contains("self.apply_ime_state(text_input);"),
+        "Wayland reset doesn't restore the IME state"
+    );
+    let apply = section(&state, "pub fn apply_ime_state(", "\n    }\n");
+    for request in ["set_content_type_by_purpose", "set_cursor_rectangle", "set_surrounding_text"] {
+        assert!(apply.contains(request), "enabling text input doesn't restore `{request}`");
     }
+}
+
+#[test]
+fn wayland_surrounding_text_deletion_goes_with_a_commit() {
+    // text-input-v3 applies a deletion after removing the preedit and before inserting the
+    // commit. winit 0.30's `Ime` has no deletion event, so the deletion is handed to the window
+    // as its commit is delivered, and a deletion without a commit gets an empty one.
+    let text_input = source("linux/wayland/seat/text_input/mod.rs");
+    let done = section(&text_input, "TextInputEvent::Done { .. } => {", "\n            },\n");
+    assert!(
+        done.contains("text_input_data.pending_commit = Some(String::new());"),
+        "a deletion without a commit isn't delivered"
+    );
+    assert!(
+        done.contains("state.ime_deletions.push_back(delete);"),
+        "commits don't queue their deletion"
+    );
+    let event_loop = source("linux/wayland/event_loop/mod.rs");
+    assert!(
+        event_loop.contains("window.lock().unwrap().ime_delete_surrounding = delete;"),
+        "delivering a commit doesn't hand its deletion to the window"
+    );
 }
 
 #[test]
