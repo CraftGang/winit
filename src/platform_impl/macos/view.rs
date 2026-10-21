@@ -1131,6 +1131,26 @@ impl WinitView {
         }
     }
 
+    /// End the composition without committing it: the caret moved to other text.
+    pub(super) fn reset_ime(&self) {
+        self.ivars().ime_document.borrow_mut().reset();
+        self.ivars().pending_commit.set(false);
+        if self.ivars().marked_text.borrow().length() == 0 {
+            return;
+        }
+        if let Some(input_context) = self.inputContext() {
+            input_context.discardMarkedText();
+        }
+        // The input method may have ended the preedit through `unmarkText` already.
+        if self.ivars().marked_text.borrow().length() > 0 {
+            *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+            self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+        }
+        if self.ivars().ime_state.get() == ImeState::Preedit {
+            self.ivars().ime_state.set(ImeState::Ground);
+        }
+    }
+
     pub(super) fn set_ime_cursor_area(&self, position: NSPoint, size: NSSize) {
         self.ivars().ime_position.set(position);
         self.ivars().ime_size.set(size);

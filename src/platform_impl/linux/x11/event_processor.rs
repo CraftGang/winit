@@ -125,38 +125,11 @@ impl EventProcessor {
     where
         F: FnMut(&RootAEL, Event<T>),
     {
+        // Requests made since the last event go first: a reset or allow request made when focus
+        // moved to another field has to reach the input method before the next key does.
+        self.handle_ime_requests(&mut callback);
         self.process_xevent(xev, &mut callback);
-
-        let window_target = Self::window_target_mut(&mut self.target);
-
-        // Handle IME requests.
-        while let Ok(request) = self.ime_receiver.try_recv() {
-            let ime = match window_target.ime.as_mut() {
-                Some(ime) => ime,
-                None => continue,
-            };
-            let ime = ime.get_mut();
-            match request {
-                ImeRequest::Position(window_id, x, y) => {
-                    self.ime_spots.insert(window_id, (x, y));
-                },
-                // Toolkits allow IME when a text field gains focus and disallow it when the field
-                // loses it, while the window keeps the focus, so no focus event follows. The
-                // context is focused here, or reset and unfocused so the input method drops the
-                // composition and its candidate window.
-                ImeRequest::Allow(window_id, allowed) => {
-                    if let Ok(true) = ime.set_ime_allowed(window_id, allowed) {
-                        if !allowed {
-                            let _ = ime.reset(window_id);
-                            let _ = ime.unfocus(window_id);
-                        } else if self.active_window == Some(window_id as xproto::Window) {
-                            let _ = ime.focus(window_id);
-                        }
-                    }
-                },
-            }
-        }
-        self.send_ime_spots();
+        self.handle_ime_requests(&mut callback);
 
         // Drain IME events.
         while let Ok((window, event)) = self.ime_event_receiver.try_recv() {
@@ -183,6 +156,58 @@ impl EventProcessor {
             };
 
             callback(&self.target, Event::WindowEvent { window_id, event });
+        }
+    }
+
+    fn handle_ime_requests<T: 'static, F>(&mut self, callback: &mut F)
+    where
+        F: FnMut(&RootAEL, Event<T>),
+    {
+        let window_target = Self::window_target_mut(&mut self.target);
+
+        let mut reset_windows = Vec::new();
+        while let Ok(request) = self.ime_receiver.try_recv() {
+            let ime = match window_target.ime.as_mut() {
+                Some(ime) => ime,
+                None => continue,
+            };
+            let ime = ime.get_mut();
+            match request {
+                ImeRequest::Position(window_id, x, y) => {
+                    self.ime_spots.insert(window_id, (x, y));
+                },
+                // Toolkits allow IME when a text field gains focus and disallow it when the field
+                // loses it, while the window keeps the focus, so no focus event follows. The
+                // context is focused here, or reset and unfocused so the input method drops the
+                // composition and its candidate window.
+                ImeRequest::Allow(window_id, allowed) => {
+                    if let Ok(true) = ime.set_ime_allowed(window_id, allowed) {
+                        if !allowed {
+                            let _ = ime.reset(window_id);
+                            let _ = ime.unfocus(window_id);
+                        } else if self.active_window == Some(window_id as xproto::Window) {
+                            let _ = ime.focus(window_id);
+                        }
+                    }
+                },
+                ImeRequest::Reset(window_id) if ime.is_ime_allowed(window_id) => {
+                    if let Ok(true) = ime.reset(window_id) {
+                        reset_windows.push(window_id);
+                    }
+                },
+                ImeRequest::Reset(_) => {},
+            }
+        }
+        self.send_ime_spots();
+
+        // Input methods don't always end the preedit they discard on reset.
+        for window in reset_windows {
+            if self.is_composing {
+                self.is_composing = false;
+                let event = WindowEvent::Ime(Ime::Preedit(String::new(), None));
+                let window_id = mkwid(window as xproto::Window);
+                callback(&self.target, Event::WindowEvent { window_id, event });
+            }
         }
     }
 

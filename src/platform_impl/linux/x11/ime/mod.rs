@@ -40,6 +40,9 @@ pub enum ImeRequest {
 
     /// Allow IME input for the given `window_id`.
     Allow(ffi::Window, bool),
+
+    /// Discard the composition of the given `window_id`.
+    Reset(ffi::Window),
 }
 
 #[derive(Debug)]
