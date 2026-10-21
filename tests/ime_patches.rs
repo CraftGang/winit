@@ -165,16 +165,66 @@ fn macos_text_inserted_outside_a_key_press_is_committed() {
     let view = source("macos/view.rs");
     let insert_text = view_method(&view, "fn insert_text(");
     assert!(
-        insert_text.contains(
-            "} else if !self.ivars().in_key_down.get()\n                && \
-             self.ivars().ime_allowed.get()"
-        ),
+        insert_text.contains("match plain_insert(&string, key_characters.as_deref()) {")
+            && insert_text.contains("PlainInsert::Commit if self.ivars().ime_allowed.get() => {"),
         "text inserted outside a key press is dropped"
     );
-    // #4748's `selectedRange` change for dictation is left out: reporting a selection turns on
-    // press-and-hold for every held key (an accent menu instead of key repeat).
+}
+
+#[test]
+fn macos_text_typed_without_a_composition_is_committed() {
+    // Chinese input methods type full-width punctuation (`，` for `,`) and Japanese ones an
+    // ideographic space for Space with `insertText` and no composition. winit 0.30.13 sends the
+    // key instead, with the key's own text. Text other than the key's is committed and the key's
+    // text isn't sent (`plain_insert`).
+    let view = source("macos/view.rs");
+    let key_down = view_method(&view, "fn key_down(");
+    assert!(
+        key_down.contains("self.ivars().key_characters.replace(Some(characters));"),
+        "keyDown doesn't tell insertText which characters the key types"
+    );
+}
+
+#[test]
+fn macos_input_methods_see_a_caret_and_replace_text() {
+    // winit 0.30.13 reports no selection, so dictation inserts nothing (rust-windowing/winit#4666),
+    // and ignores replacement ranges, so a press-and-hold accent is typed after the letter instead
+    // of replacing it (#3617). The view reports a caret after the text typed since it last moved
+    // (`ImeDocument`) and deletes replaced text with Backspace presses.
+    let view = source("macos/view.rs");
     let selected_range = view_method(&view, "fn selected_range(&self) -> NSRange {");
-    assert!(!selected_range.contains("marked_text"), "selectedRange reports a selection");
+    assert!(selected_range.contains("ime_document"), "selectedRange reports no caret");
+    // With a caret, AppKit's press-and-hold takes the repeats of a held letter; they aren't typed.
+    let key_down = view_method(&view, "fn key_down(");
+    assert!(
+        key_down.contains("&& !held_for_accents {"),
+        "a held letter repeats under the accent menu"
+    );
+    for method in ["fn set_marked_text(", "fn insert_text("] {
+        assert!(
+            view_method(&view, method).contains("self.delete_replaced(replacement_range);"),
+            "{method} ignores its replacement range"
+        );
+    }
+}
+
+#[test]
+fn macos_input_methods_can_call_a_view_without_a_window() {
+    // An input method can ask for the caret rectangle or send text while the window is torn down.
+    // winit 0.30.13 then panics on the missing window inside an Objective-C callback, which aborts
+    // (rust-windowing/winit#4333, fixed on master by d6f7a28).
+    let view = source("macos/view.rs");
+    let first_rect = view_method(&view, "fn first_rect_for_character_range(");
+    assert!(
+        first_rect.contains("let Some(window) = (**self).window() else {"),
+        "firstRectForCharacterRange needs a window"
+    );
+    let queue_event = section(&view, "fn queue_event(", "\n    }\n");
+    assert!(
+        queue_event.contains("let Some(window) = self.ivars()._ns_window.load() else {"),
+        "queuing an event needs a window"
+    );
+    assert!(!view.contains(".expect(\"input context\")"), "a missing input context panics");
 }
 
 #[test]
@@ -201,10 +251,14 @@ fn macos_key_committed_through_ime_is_sent_once() {
     );
 }
 
-// `ImeStartup` is plain Rust, so its policy tests run on every platform.
+// `ImeStartup` and `ImeDocument` are plain Rust, so their tests run on every platform.
 #[allow(dead_code)]
 #[path = "../src/platform_impl/macos/ime_startup.rs"]
 mod ime_startup;
+
+#[allow(dead_code)]
+#[path = "../src/platform_impl/macos/ime_document.rs"]
+mod ime_document;
 
 #[test]
 fn macos_first_apple_korean_key_is_retried_once() {

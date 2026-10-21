@@ -15,6 +15,7 @@ use objc2_foundation::{
     NSMutableAttributedString, NSNotFound, NSNotificationCenter, NSObject, NSObjectProtocol,
     NSPoint, NSRange, NSRect, NSSize, NSString, NSUInteger,
 };
+use smol_str::SmolStr;
 
 use super::app_state::ApplicationDelegate;
 use super::cursor::{default_cursor, invisible_cursor};
@@ -22,6 +23,7 @@ use super::event::{
     code_to_key, code_to_location, create_key_event, event_mods, lalt_pressed, ralt_pressed,
     scancode_to_physicalkey, KeyEventExtra,
 };
+use super::ime_document::{plain_insert, ImeDocument, PlainInsert};
 use super::ime_startup::ImeStartup;
 use super::window::WinitWindow;
 use super::DEVICE_ID;
@@ -142,7 +144,18 @@ pub struct ViewState {
     /// True if the key being handled by `keyDown:` committed IME text.
     committed_in_key_down: Cell<bool>,
 
+    /// True if `interpretKeyEvents` called back for the key `keyDown:` is handling.
+    key_interpreted: Cell<bool>,
+
+    /// The characters of the key `keyDown:` is handling.
+    key_characters: RefCell<Option<String>>,
+
+    /// The text input methods see around the caret.
+    ime_document: RefCell<ImeDocument>,
+
     marked_text: RefCell<Retained<NSMutableAttributedString>>,
+    /// The selection within `marked_text`, in UTF-16 units.
+    marked_selection: Cell<(usize, usize)>,
     accepts_first_mouse: bool,
     /// PdfCraft patch: answers `mouseDownCanMoveWindow` (see there).
     movable_by_window_background: bool,
@@ -265,7 +278,7 @@ declare_class!(
             trace_scope!("markedRange");
             let length = self.ivars().marked_text.borrow().length();
             if length > 0 {
-                NSRange::new(0, length)
+                NSRange::new(self.ivars().ime_document.borrow().caret(), length)
             } else {
                 // Documented to return `{NSNotFound, 0}` if there is no marked range.
                 NSRange::new(NSNotFound as NSUInteger, 0)
@@ -275,8 +288,14 @@ declare_class!(
         #[method(selectedRange)]
         fn selected_range(&self) -> NSRange {
             trace_scope!("selectedRange");
-            // Documented to return `{NSNotFound, 0}` if there is no selection.
-            NSRange::new(NSNotFound as NSUInteger, 0)
+            // Dictation inserts nothing without a caret, and press-and-hold needs one to replace
+            // the letter it accents. Reporting one also replaces key repeat in text input with the
+            // accent menu, as in other Mac apps.
+            let marked_selection = (self.ivars().marked_text.borrow().length() > 0)
+                .then(|| self.ivars().marked_selection.get());
+            let (location, length) =
+                self.ivars().ime_document.borrow().selected_range(marked_selection);
+            NSRange::new(location, length)
         }
 
         #[method(setMarkedText:selectedRange:replacementRange:)]
@@ -284,11 +303,13 @@ declare_class!(
             &self,
             string: &NSObject,
             selected_range: NSRange,
-            _replacement_range: NSRange,
+            replacement_range: NSRange,
         ) {
-            // TODO: Use _replacement_range, requires changing the event to report surrounding text.
             trace_scope!("setMarkedText:selectedRange:replacementRange:");
+            self.ivars().key_interpreted.set(true);
             self.ivars().ime_startup.borrow_mut().other_callback();
+            // Press-and-hold marks the letter just typed while it shows the accent menu.
+            self.delete_replaced(replacement_range);
 
             // SAFETY: This method is guaranteed to get either a `NSString` or a `NSAttributedString`.
             let (marked_text, string) = if string.is_kind_of::<NSAttributedString>() {
@@ -327,6 +348,7 @@ declare_class!(
             self.ivars().pending_commit.set(true);
 
             let cursor_range = if string.is_empty() {
+                self.ivars().marked_selection.set((0, 0));
                 // An empty string basically means that there's no preedit, so indicate that by
                 // sending a `None` cursor range.
                 None
@@ -337,6 +359,7 @@ declare_class!(
                 let len = string.length();
                 let location = selected_range.location.min(len);
                 let end = selected_range.end().min(len);
+                self.ivars().marked_selection.set((location, end - location));
                 // Convert the selected range from UTF-16 indices to UTF-8 indices.
                 let sub_string_a = unsafe { string.substringToIndex(location) };
                 let sub_string_b = unsafe { string.substringToIndex(end) };
@@ -352,11 +375,13 @@ declare_class!(
         #[method(unmarkText)]
         fn unmark_text(&self) {
             trace_scope!("unmarkText");
+            self.ivars().key_interpreted.set(true);
             self.ivars().ime_startup.borrow_mut().other_callback();
             *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
 
-            let input_context = self.inputContext().expect("input context");
-            input_context.discardMarkedText();
+            if let Some(input_context) = self.inputContext() {
+                input_context.discardMarkedText();
+            }
 
             self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
             if self.is_ime_enabled() {
@@ -381,11 +406,18 @@ declare_class!(
         #[method_id(attributedSubstringForProposedRange:actualRange:)]
         fn attributed_substring_for_proposed_range(
             &self,
-            _range: NSRange,
-            _actual_range: *mut NSRange,
+            range: NSRange,
+            actual_range: *mut NSRange,
         ) -> Option<Retained<NSAttributedString>> {
             trace_scope!("attributedSubstringForProposedRange:actualRange:");
-            None
+            let substring =
+                self.ivars().ime_document.borrow().substring((range.location, range.length));
+            substring.map(|(text, (location, length))| {
+                if !actual_range.is_null() {
+                    unsafe { *actual_range = NSRange::new(location, length) };
+                }
+                NSAttributedString::from_nsstring(&NSString::from_str(&text))
+            })
         }
 
         #[method(characterIndexForPoint:)]
@@ -401,19 +433,22 @@ declare_class!(
             _actual_range: *mut NSRange,
         ) -> NSRect {
             trace_scope!("firstRectForCharacterRange:actualRange:");
-            let rect = NSRect::new(
-                self.ivars().ime_position.get(),
-                self.ivars().ime_size.get()
-            );
-            // Return value is expected to be in screen coordinates, so we need a conversion here
-            self.window()
-                .convertRectToScreen(self.convertRect_toView(rect, None))
+
+            // Guard when the view is no longer in a window during teardown.
+            let Some(window) = (**self).window() else {
+                return NSRect::ZERO;
+            };
+
+            // Return value is expected to be in screen coordinates, so we need a conversion
+            let rect = NSRect::new(self.ivars().ime_position.get(), self.ivars().ime_size.get());
+            let view_rect = self.convertRect_toView(rect, None);
+            window.convertRectToScreen(view_rect)
         }
 
         #[method(insertText:replacementRange:)]
-        fn insert_text(&self, string: &NSObject, _replacement_range: NSRange) {
-            // TODO: Use _replacement_range, requires changing the event to report surrounding text.
+        fn insert_text(&self, string: &NSObject, replacement_range: NSRange) {
             trace_scope!("insertText:replacementRange:");
+            self.ivars().key_interpreted.set(true);
 
             // SAFETY: This method is guaranteed to get either a `NSString` or a `NSAttributedString`.
             let string = if string.is_kind_of::<NSAttributedString>() {
@@ -441,12 +476,15 @@ declare_class!(
             if has_marked {
                 self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
             }
+            // Press-and-hold and dictation replace text they inserted before.
+            self.delete_replaced(replacement_range);
 
             // Only commit via IME if there was a real composition session.
             // Some IMEs send insertText for all typing (e.g. spaces, English chars)
             // which should go through keyboard input instead of paste.
             if pending_commit && ime_enabled && !is_control {
                 self.ivars().pending_commit.set(false);
+                self.ivars().ime_document.borrow_mut().insert(&string);
                 self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
                 // WordCraft patch: input methods also commit outside a key press (a candidate
                 // clicked with the mouse, dictation), where no key follows to clear the marked text
@@ -461,21 +499,32 @@ declare_class!(
                     *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
                     self.ivars().ime_state.set(ImeState::Ground);
                 }
-            } else if !self.ivars().in_key_down.get()
-                && self.ivars().ime_allowed.get()
-                && !string.is_empty()
-                && !is_control
-            {
+            } else {
                 // WordCraft patch: text sent outside a key press without a composition, e.g. from
-                // the emoji picker (Fn/Globe-E, Control-Command-Space). No `KeyboardInput` event
-                // will carry it, so commit it directly (rust-windowing/winit#4749, the 0.30 backport
-                // of #4748).
-                if self.ivars().ime_state.get() == ImeState::Disabled {
-                    *self.ivars().input_source.borrow_mut() = self.current_input_source();
-                    self.ivars().ime_state.set(ImeState::Ground);
-                    self.queue_event(WindowEvent::Ime(Ime::Enabled));
+                // the emoji picker (Fn/Globe-E, Control-Command-Space), isn't carried by any
+                // `KeyboardInput` event, so commit it directly (rust-windowing/winit#4749, the 0.30
+                // backport of #4748). The same goes for text other than the key's that an input
+                // method types without a composition during a key press: Chinese punctuation
+                // (`，` for `,`), an ideographic space, an accent picked from the press-and-hold
+                // menu with a digit.
+                let key_characters = self.ivars().key_characters.borrow().clone();
+                match plain_insert(&string, key_characters.as_deref()) {
+                    PlainInsert::KeyText => self.ivars().ime_document.borrow_mut().insert(&string),
+                    PlainInsert::Commit if self.ivars().ime_allowed.get() => {
+                        if self.ivars().ime_state.get() == ImeState::Disabled {
+                            *self.ivars().input_source.borrow_mut() = self.current_input_source();
+                            self.ivars().ime_state.set(ImeState::Ground);
+                            self.queue_event(WindowEvent::Ime(Ime::Enabled));
+                        }
+                        if self.ivars().in_key_down.get() {
+                            // `keyDown:` doesn't send the key's own text.
+                            self.ivars().committed_in_key_down.set(true);
+                        }
+                        self.ivars().ime_document.borrow_mut().insert(&string);
+                        self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
+                    }
+                    PlainInsert::Commit | PlainInsert::Ignore => {}
                 }
-                self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
             }
         }
 
@@ -484,6 +533,7 @@ declare_class!(
         #[method(doCommandBySelector:)]
         fn do_command_by_selector(&self, _command: Sel) {
             trace_scope!("doCommandBySelector:");
+            self.ivars().key_interpreted.set(true);
             self.ivars().ime_startup.borrow_mut().other_callback();
             // We shouldn't forward any character from just committed text, since we'll end up sending
             // it twice with some IMEs like Korean one. We'll also always send `Enter` in that case,
@@ -492,6 +542,8 @@ declare_class!(
                 return;
             }
 
+            // Commands such as arrows and Backspace move the caret or change the text.
+            self.ivars().ime_document.borrow_mut().reset();
             self.ivars().forward_key_to_app.set(true);
 
             if unsafe { self.hasMarkedText() } && self.ivars().ime_state.get() == ImeState::Preedit
@@ -548,9 +600,16 @@ declare_class!(
             // we must send the `KeyboardInput` event during IME if it triggered
             // `doCommandBySelector`. (doCommandBySelector means that the keyboard input
             // is not handled by IME and should be handled by the application)
+            if modifiers.intersects(ModifiersState::SUPER | ModifiersState::CONTROL) {
+                // Shortcuts can change the text (undo, paste) or move the caret.
+                self.ivars().ime_document.borrow_mut().reset();
+            }
+
             if self.ivars().ime_allowed.get() {
                 let events_for_nsview = NSArray::from_slice(&[&*event]);
                 self.ivars().in_key_down.set(true);
+                self.ivars().key_interpreted.set(false);
+                let outer_key = self.ivars().key_characters.replace(Some(characters));
                 unsafe { self.interpretKeyEvents(&events_for_nsview) };
 
                 let same_context = self.ivars().ime_allowed.get()
@@ -563,6 +622,7 @@ declare_class!(
                 if retry {
                     unsafe { self.interpretKeyEvents(&events_for_nsview) };
                 }
+                self.ivars().key_characters.replace(outer_key);
                 self.ivars().in_key_down.set(false);
 
                 // If the text was committed we must treat the next keyboard event as IME related.
@@ -591,7 +651,14 @@ declare_class!(
             // ground state, so the space arrived twice (rust-windowing/winit#4478).
             let had_ime_input = self.ivars().committed_in_key_down.replace(false) || had_ime_input;
 
-            if !had_ime_input || self.ivars().forward_key_to_app.get() {
+            // With press-and-hold, the input method takes the repeats of a held letter to show its
+            // accent menu and calls nothing back. Their text isn't typed.
+            let held_for_accents = self.ivars().ime_allowed.get()
+                && unsafe { event.isARepeat() }
+                && !self.ivars().key_interpreted.get()
+                && !modifiers.intersects(ModifiersState::SUPER | ModifiersState::CONTROL);
+
+            if (!had_ime_input || self.ivars().forward_key_to_app.get()) && !held_for_accents {
                 let key_event = create_key_event(&event, true, unsafe { event.isARepeat() });
                 self.queue_event(WindowEvent::KeyboardInput {
                     device_id: DEVICE_ID,
@@ -923,7 +990,11 @@ impl WinitView {
             forward_key_to_app: Default::default(),
             in_key_down: Default::default(),
             committed_in_key_down: Default::default(),
+            key_interpreted: Default::default(),
+            key_characters: Default::default(),
+            ime_document: Default::default(),
             marked_text: Default::default(),
+            marked_selection: Default::default(),
             accepts_first_mouse,
             movable_by_window_background,
             _ns_window: WeakId::new(&window.retain()),
@@ -957,7 +1028,12 @@ impl WinitView {
     }
 
     fn queue_event(&self, event: WindowEvent) {
-        self.ivars().app_delegate.maybe_queue_window_event(self.window().id(), event);
+        // Input methods can call the view while the window is torn down; a panic here aborts.
+        let Some(window) = self.ivars()._ns_window.load() else {
+            tracing::debug!("dropping {event:?} for a window that is gone");
+            return;
+        };
+        self.ivars().app_delegate.maybe_queue_window_event(window.id(), event);
     }
 
     fn scale_factor(&self) -> f64 {
@@ -978,10 +1054,26 @@ impl WinitView {
 
     fn current_input_source(&self) -> String {
         self.inputContext()
-            .expect("input context")
-            .selectedKeyboardInputSource()
+            .and_then(|input_context| input_context.selectedKeyboardInputSource())
             .map(|input_source| input_source.to_string())
             .unwrap_or_default()
+    }
+
+    /// Delete the text an input method replaces with Backspace presses, which toolkits already
+    /// handle (Linux input methods without surrounding text do the same).
+    fn delete_replaced(&self, range: NSRange) {
+        let range =
+            (range.location != NSNotFound as NSUInteger).then_some((range.location, range.length));
+        let replaced = self.ivars().ime_document.borrow_mut().replace(range);
+        for _ in replaced.chars() {
+            for state in [ElementState::Pressed, ElementState::Released] {
+                self.queue_event(WindowEvent::KeyboardInput {
+                    device_id: DEVICE_ID,
+                    event: backspace_event(state),
+                    is_synthetic: false,
+                });
+            }
+        }
     }
 
     pub(super) fn cursor_icon(&self) -> Retained<NSCursor> {
@@ -1012,6 +1104,7 @@ impl WinitView {
         }
         self.ivars().ime_allowed.set(ime_allowed);
         self.ivars().ime_startup.borrow_mut().reset();
+        self.ivars().ime_document.borrow_mut().reset();
         if self.ivars().ime_allowed.get() {
             return;
         }
@@ -1023,8 +1116,9 @@ impl WinitView {
         // `unmarkText` from here; IME is still enabled then, so its `Preedit("")` comes before
         // `Disabled`.
         if self.ivars().marked_text.borrow().length() > 0 {
-            let input_context = self.inputContext().expect("input context");
-            input_context.discardMarkedText();
+            if let Some(input_context) = self.inputContext() {
+                input_context.discardMarkedText();
+            }
         }
 
         // Clear markedText
@@ -1040,8 +1134,9 @@ impl WinitView {
     pub(super) fn set_ime_cursor_area(&self, position: NSPoint, size: NSSize) {
         self.ivars().ime_position.set(position);
         self.ivars().ime_size.set(size);
-        let input_context = self.inputContext().expect("input context");
-        input_context.invalidateCharacterCoordinates();
+        if let Some(input_context) = self.inputContext() {
+            input_context.invalidateCharacterCoordinates();
+        }
     }
 
     /// Reset modifiers and emit a synthetic ModifiersChanged event if deemed necessary.
@@ -1191,6 +1286,11 @@ impl WinitView {
     fn mouse_click(&self, event: &NSEvent, button_state: ElementState) {
         let button = mouse_button(event);
 
+        if button_state == ElementState::Pressed {
+            // A click can move the caret.
+            self.ivars().ime_document.borrow_mut().reset();
+        }
+
         self.update_modifiers(event, false);
 
         self.queue_event(WindowEvent::MouseInput {
@@ -1225,6 +1325,23 @@ impl WinitView {
             device_id: DEVICE_ID,
             position: view_point.to_physical(self.scale_factor()),
         });
+    }
+}
+
+/// A Backspace press or release that no key made.
+fn backspace_event(state: ElementState) -> KeyEvent {
+    let key = Key::Named(NamedKey::Backspace);
+    KeyEvent {
+        physical_key: KeyCode::Backspace.into(),
+        text: (state == ElementState::Pressed).then(|| key.to_text().map(SmolStr::new)).flatten(),
+        logical_key: key.clone(),
+        location: KeyLocation::Standard,
+        state,
+        repeat: false,
+        platform_specific: KeyEventExtra {
+            text_with_all_modifiers: Some(SmolStr::new("\u{7f}")),
+            key_without_modifiers: key,
+        },
     }
 }
 
