@@ -152,9 +152,8 @@ impl ImeContext {
         }
     }
 
-    /// Discards the composition. The IME then ends it with `WM_IME_COMPOSITION` and
-    /// `WM_IME_ENDCOMPOSITION`, which clear the preedit; nothing is committed, since the result
-    /// string stays empty.
+    /// Asks the IME to discard the composition (`NI_COMPOSITIONSTR`, `CPS_CANCEL`). Which
+    /// composition messages the IME sends in response, if any, depends on the IME.
     pub unsafe fn cancel_composition(&self) {
         unsafe { ImmNotifyIME(self.himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0) };
     }

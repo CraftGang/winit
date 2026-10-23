@@ -173,7 +173,8 @@ fn wayland_surrounding_text_deletion_goes_with_a_commit() {
 #[test]
 fn windows_reset_ime_cancels_the_composition() {
     // `CPS_CANCEL` discards the composition string; `CPS_COMPLETE` would commit it instead. The
-    // IME's own end-of-composition messages clear the preedit.
+    // window leaves `Preedit` before cancelling, so `WM_IME_ENDCOMPOSITION` doesn't commit the
+    // result string, and clears the preedit itself, since IMEs differ in what they send.
     let ime = source("windows/ime.rs");
     assert!(
         ime.contains("ImmNotifyIME(self.himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0)"),
@@ -181,7 +182,19 @@ fn windows_reset_ime_cancels_the_composition() {
     );
     let window = source("windows/window.rs");
     let reset = section(&window, "pub fn reset_ime(&self) {", "\n    }\n");
-    assert!(reset.contains(".cancel_composition()"), "reset_ime doesn't cancel the composition");
+    assert!(reset.contains("RESET_IME_MSG_ID"), "reset_ime doesn't reach the window procedure");
+    let event_loop = source("windows/event_loop.rs");
+    let handler = section(&event_loop, "msg == RESET_IME_MSG_ID.get()", "result = ProcResult");
+    let leave_preedit = handler.find("w.ime_state = ImeState::Enabled;");
+    let cancel = handler.find(".cancel_composition()");
+    assert!(
+        leave_preedit.is_some() && cancel.is_some() && leave_preedit < cancel,
+        "reset_ime cancels while still in Preedit, so ENDCOMPOSITION can commit"
+    );
+    assert!(
+        handler.contains("Ime::Preedit(String::new(), None)"),
+        "reset_ime doesn't clear the preedit"
+    );
 }
 
 /// A method in `WinitView`'s `define_class!` block.

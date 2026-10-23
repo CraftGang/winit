@@ -34,14 +34,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, EnableMenuItem, FlashWindowEx, GetClientRect, GetCursorPos,
     GetForegroundWindow, GetSystemMenu, GetSystemMetrics, GetWindowPlacement, GetWindowTextLengthW,
     GetWindowTextW, IsWindowVisible, LoadCursorW, PeekMessageW, PostMessageW, RegisterClassExW,
-    SetCursor, SetCursorPos, SetForegroundWindow, SetMenuDefaultItem, SetWindowDisplayAffinity,
-    SetWindowPlacement, SetWindowPos, SetWindowTextW, TrackPopupMenu, CS_HREDRAW, CS_VREDRAW,
-    CW_USEDEFAULT, FLASHWINFO, FLASHW_ALL, FLASHW_STOP, FLASHW_TIMERNOFG, FLASHW_TRAY,
-    GWLP_HINSTANCE, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT, HTTOP,
-    HTTOPLEFT, HTTOPRIGHT, MENU_ITEM_STATE, MFS_DISABLED, MFS_ENABLED, MF_BYCOMMAND, NID_READY,
-    PM_NOREMOVE, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE, SC_RESTORE, SC_SIZE, SM_DIGITIZER,
-    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, TPM_LEFTALIGN, TPM_RETURNCMD,
-    WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_NCLBUTTONDOWN, WM_SYSCOMMAND, WNDCLASSEXW,
+    SendMessageW, SetCursor, SetCursorPos, SetForegroundWindow, SetMenuDefaultItem,
+    SetWindowDisplayAffinity, SetWindowPlacement, SetWindowPos, SetWindowTextW, TrackPopupMenu,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, FLASHWINFO, FLASHW_ALL, FLASHW_STOP, FLASHW_TIMERNOFG,
+    FLASHW_TRAY, GWLP_HINSTANCE, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT,
+    HTTOP, HTTOPLEFT, HTTOPRIGHT, MENU_ITEM_STATE, MFS_DISABLED, MFS_ENABLED, MF_BYCOMMAND,
+    NID_READY, PM_NOREMOVE, SC_CLOSE, SC_MAXIMIZE, SC_MINIMIZE, SC_MOVE, SC_RESTORE, SC_SIZE,
+    SM_DIGITIZER, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, TPM_LEFTALIGN,
+    TPM_RETURNCMD, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_NCLBUTTONDOWN, WM_SYSCOMMAND, WNDCLASSEXW,
 };
 
 use tracing::warn;
@@ -59,14 +59,16 @@ use crate::platform_impl::platform::dpi::{
     dpi_to_scale_factor, enable_non_client_dpi_scaling, hwnd_dpi,
 };
 use crate::platform_impl::platform::drop_handler::FileDropHandler;
-use crate::platform_impl::platform::event_loop::{self, ActiveEventLoop, DESTROY_MSG_ID};
+use crate::platform_impl::platform::event_loop::{
+    self, ActiveEventLoop, DESTROY_MSG_ID, RESET_IME_MSG_ID,
+};
 use crate::platform_impl::platform::icon::{self, IconType, WinCursor};
 use crate::platform_impl::platform::ime::ImeContext;
 use crate::platform_impl::platform::ime_caret::CaretArea;
 use crate::platform_impl::platform::keyboard::KeyEventBuilder;
 use crate::platform_impl::platform::monitor::{self, MonitorHandle};
 use crate::platform_impl::platform::window_state::{
-    CursorFlags, ImeState, SavedWindow, WindowFlags, WindowState,
+    CursorFlags, SavedWindow, WindowFlags, WindowState,
 };
 use crate::platform_impl::platform::{util, Fullscreen, SelectedCursor, WindowId};
 use crate::window::{
@@ -946,17 +948,10 @@ impl Window {
 
     #[inline]
     pub fn reset_ime(&self) {
+        // Handled in the window procedure, which can send the cleared preedit.
         let window = self.window;
-        let state = self.window_state.clone();
         self.thread_executor.execute_in_thread(move || unsafe {
-            // Not while holding the lock: the IME's messages arrive during the call.
-            let composing = {
-                let state = state.lock().unwrap();
-                state.ime_allowed && state.ime_state == ImeState::Preedit
-            };
-            if composing {
-                ImeContext::current(window).cancel_composition();
-            }
+            SendMessageW(window, RESET_IME_MSG_ID.get(), 0, 0);
         })
     }
 

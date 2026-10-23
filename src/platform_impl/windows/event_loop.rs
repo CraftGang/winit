@@ -901,6 +901,8 @@ pub(crate) static DESTROY_MSG_ID: LazyMessageId = LazyMessageId::new("Winit::Des
 // documentation in the `window_state` module for more information.
 pub(crate) static SET_RETAIN_STATE_ON_SIZE_MSG_ID: LazyMessageId =
     LazyMessageId::new("Winit::SetRetainMaximized\0");
+// Message sent by `Window::reset_ime` on the window's thread. WPARAM and LPARAM are unused.
+pub(crate) static RESET_IME_MSG_ID: LazyMessageId = LazyMessageId::new("Winit::ResetIme\0");
 static THREAD_EVENT_TARGET_WINDOW_CLASS: Lazy<Vec<u16>> =
     Lazy::new(|| util::encode_wide("Winit Thread Event Target"));
 /// When the taskbar is created, it registers a message with the "TaskbarCreated" string and then
@@ -2461,6 +2463,26 @@ unsafe fn public_window_callback_inner(
                 window_state.set_window_flags_in_place(|f| {
                     f.set(WindowFlags::MARKER_RETAIN_STATE_ON_SIZE, wparam != 0)
                 });
+                result = ProcResult::Value(0);
+            } else if msg == RESET_IME_MSG_ID.get() {
+                // Leave `Preedit` before cancelling, so `WM_IME_ENDCOMPOSITION` doesn't read the
+                // result string and commit it. The lock is released before the call, since the
+                // IME may send its messages during it.
+                let was_composing = {
+                    let mut w = userdata.window_state_lock();
+                    let composing = w.ime_allowed && w.ime_state == ImeState::Preedit;
+                    if composing {
+                        w.ime_state = ImeState::Enabled;
+                    }
+                    composing
+                };
+                if was_composing {
+                    unsafe { ImeContext::current(window).cancel_composition() };
+                    userdata.send_event(Event::WindowEvent {
+                        window_id: RootWindowId(WindowId(window)),
+                        event: WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+                    });
+                }
                 result = ProcResult::Value(0);
             } else if msg == TASKBAR_CREATED.get() {
                 let window_state = userdata.window_state_lock();
