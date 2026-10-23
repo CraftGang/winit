@@ -297,6 +297,14 @@ fn macos_input_methods_see_a_caret_and_replace_text() {
             "{method} ignores its replacement range"
         );
     }
+    // Text `insertText` drops (emoji picker or dictation text while IME isn't allowed) leaves the
+    // document alone, or its caret falls behind the app's.
+    let insert_text = view_method(&view, "fn insert_text(");
+    let decided = insert_text.find("if pending_commit && ime_enabled").expect("no commit branch");
+    assert!(
+        !insert_text[..decided].contains("self.replaced("),
+        "insertText replaces text before deciding whether to deliver it"
+    );
 }
 
 #[test]

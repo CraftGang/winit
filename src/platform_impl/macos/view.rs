@@ -481,16 +481,16 @@ declare_class!(
             if has_marked {
                 self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
             }
-            // Press-and-hold and dictation replace text they inserted before.
-            let mut delete = self.replaced(replacement_range);
-
             // Only commit via IME if there was a real composition session.
             // Some IMEs send insertText for all typing (e.g. spaces, English chars)
             // which should go through keyboard input instead of paste.
             if pending_commit && ime_enabled && !is_control {
                 self.ivars().pending_commit.set(false);
+                // Press-and-hold and dictation replace text they inserted before. Only the arms
+                // that deliver the text apply the replacement to `ime_document`.
+                let delete = self.replaced(replacement_range);
                 self.ivars().ime_document.borrow_mut().insert(&string);
-                self.queue_commit(string, delete.take());
+                self.queue_commit(string, delete);
                 // WordCraft patch: input methods also commit outside a key press (a candidate
                 // clicked with the mouse, dictation), where no key follows to clear the marked text
                 // and reset the state: the next key would be swallowed
@@ -515,23 +515,26 @@ declare_class!(
                 let key_characters = self.ivars().key_characters.borrow().clone();
                 match plain_insert(&string, key_characters.as_deref()) {
                     PlainInsert::KeyText => {
+                        let delete = self.replaced(replacement_range);
                         // The deletion goes before the key's `KeyboardInput`, which `keyDown:`
                         // sends after this returns.
                         if delete.is_some() && self.ivars().ime_allowed.get() {
                             self.notify_ime_enabled();
-                            self.queue_commit(String::new(), delete.take());
+                            self.queue_commit(String::new(), delete);
                         }
                         self.ivars().ime_document.borrow_mut().insert(&string)
                     },
                     PlainInsert::Commit if self.ivars().ime_allowed.get() => {
+                        let delete = self.replaced(replacement_range);
                         self.notify_ime_enabled();
                         if self.ivars().in_key_down.get() {
                             // `keyDown:` doesn't send the key's own text.
                             self.ivars().committed_in_key_down.set(true);
                         }
                         self.ivars().ime_document.borrow_mut().insert(&string);
-                        self.queue_commit(string, delete.take());
+                        self.queue_commit(string, delete);
                     },
+                    // Dropped text leaves `ime_document` as it is.
                     PlainInsert::Commit | PlainInsert::Ignore => {},
                 }
             }
