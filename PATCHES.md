@@ -39,4 +39,12 @@ file drag (W15), remove the seat from winit's clipboard (W15), destroy the seat'
 W17–W27 are the language-support patches (storytold/craft-libs#198); W16 stays with the pinch/rotation
 patch below.
 
+W22 gives every macOS window with IME allowed a real caret, so input methods send replacement
+ranges: press-and-hold accents, dictation corrections, and input methods that switch from marked
+text to `insertText:replacementRange:` once they see a caret. An app must call
+`WindowExtMacOS::take_ime_delete_surrounding` (W26) when it handles each `Ime::Commit`, or the
+replaced text stays and the new text is typed after it. egui-winit `craft/0.37` calls it. With the
+caret, a held letter in such a window also stops repeating, because AppKit's press-and-hold takes the
+repeats, as in native text fields.
+
 Not in this cut: W16 (Wayland pinch/rotation, #4778), the earlier tablet backport (replaced by `craft-tablet`).
