@@ -1304,15 +1304,16 @@ impl Window {
     /// text, as when the text cursor moves to another field or the user clicks elsewhere in the
     /// text.
     ///
-    /// The composition is dropped, not committed, and the window receives an empty
-    /// [`Ime::Preedit`] if one was in progress. To keep the composed text, insert the last preedit
+    /// The composition is dropped, not committed (except on Wayland, see below), and the window
+    /// receives an empty [`Ime::Preedit`] if one was in progress. To keep the composed text, insert the last preedit
     /// text before calling this. Has no effect while IME is not allowed.
     ///
     /// ## Platform-specific
     ///
     /// - **X11:** Resets the window's input context (`XmbResetIC`).
     /// - **Wayland:** Disables and re-enables text input, then restores the purpose and cursor
-    ///   area.
+    ///   area. This discards the preedit where the input method allows: input methods set to
+    ///   commit on focus-out (an fcitx5 option) commit it instead.
     /// - **Windows:** Cancels the composition string (`ImmNotifyIME` with `CPS_CANCEL`).
     /// - **macOS:** Discards the marked text (`NSTextInputContext discardMarkedText`).
     /// - **iOS / Android / Web / Orbital:** Unsupported.

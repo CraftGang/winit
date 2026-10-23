@@ -1097,7 +1097,8 @@ impl WindowState {
         }
     }
 
-    /// Discards the composition. Returns `true` if the window was showing a preedit.
+    /// Discards the composition where the input method allows; input methods that commit on
+    /// focus-out commit it. Returns `true` if the window was showing a preedit.
     pub fn reset_ime(&self) -> bool {
         let mut preedit_shown = false;
         for text_input in &self.text_inputs {
