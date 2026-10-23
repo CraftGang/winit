@@ -47,4 +47,10 @@ replaced text stays and the new text is typed after it. egui-winit `craft/0.37` 
 caret, a held letter in such a window also stops repeating, because AppKit's press-and-hold takes the
 repeats, as in native text fields.
 
+W19 needs a test on Windows before it is proposed upstream. It drops every `VK_PROCESSKEY` key-down,
+so a key that ends a composition acts only if the IME passes the real key on afterwards. With the
+Microsoft Korean IME (type 한) and the Microsoft Japanese IME (inside a composition), check that the
+arrow keys, Enter, Tab and Backspace still act. If they don't, limit the suppression to keys the
+composition consumes.
+
 Not in this cut: W16 (Wayland pinch/rotation, #4778), the earlier tablet backport (replaced by `craft-tablet`).
