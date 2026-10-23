@@ -165,7 +165,8 @@ pub trait WindowExtWayland {
     /// `anchor`; without a selection they are equal. Leave the preedit out of `text`. Offsets
     /// are clamped to the text and moved back to a character boundary, and text longer than
     /// 4000 bytes is cut around the cursor and selection. Call it again whenever the text, cursor
-    /// or selection changes. Disallowing IME forgets the text. X11 ignores it.
+    /// or selection changes; a call with the same text, cursor and anchor as the last one sends
+    /// nothing. Disallowing IME forgets the text. X11 ignores it.
     fn set_ime_surrounding_text(&self, text: &str, cursor: usize, anchor: usize);
     /// The surrounding text to delete before inserting the [`Ime::Commit`] being handled.
     ///

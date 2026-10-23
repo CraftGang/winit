@@ -1066,6 +1066,14 @@ impl WindowState {
     pub fn set_ime_surrounding_text(&mut self, text: &str, cursor: usize, anchor: usize) {
         let (text, cursor, anchor) = surrounding_text_excerpt(text, cursor, anchor);
         let (cursor, anchor) = (cursor as i32, anchor as i32);
+        // Each commit makes the compositor send `done`, and input-method-v2 compositors ignore
+        // input-method commits made against an older serial, so an app calling this every frame
+        // would lose typed text.
+        let unchanged =
+            |(t, c, a): &(String, i32, i32)| (t.as_str(), *c, *a) == (text, cursor, anchor);
+        if self.ime_surrounding_text.as_ref().is_some_and(unchanged) {
+            return;
+        }
         if self.ime_allowed {
             for text_input in &self.text_inputs {
                 text_input.set_surrounding_text(text.to_owned(), cursor, anchor);

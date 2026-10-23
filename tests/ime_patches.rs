@@ -171,6 +171,18 @@ fn wayland_surrounding_text_deletion_goes_with_a_commit() {
 }
 
 #[test]
+fn wayland_unchanged_surrounding_text_sends_nothing() {
+    // Each text-input commit makes the compositor send `done`, and input-method-v2 compositors
+    // ignore input-method commits against an older serial, so an app that sets the surrounding
+    // text every frame would lose typed text.
+    let state = source("linux/wayland/window/state.rs");
+    let set = section(&state, "pub fn set_ime_surrounding_text(", "\n    }\n");
+    let early_return = set.find("return;").expect("unchanged surrounding text is sent again");
+    let commit = set.find("text_input.commit();").expect("surrounding text isn't committed");
+    assert!(early_return < commit, "unchanged surrounding text is sent again");
+}
+
+#[test]
 fn windows_reset_ime_cancels_the_composition() {
     // `CPS_CANCEL` discards the composition string; `CPS_COMPLETE` would commit it instead. The
     // window leaves `Preedit` before cancelling, so `WM_IME_ENDCOMPOSITION` doesn't commit the
