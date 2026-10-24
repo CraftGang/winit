@@ -229,8 +229,12 @@ impl DataDeviceHandler for WinitState {
         }
     }
 
-    // The clipboard reads the device's current selection when asked.
-    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, data_device: &WlDataDevice) {
+        let data = data_device.data::<DataDeviceData>().unwrap();
+        let seat = data.seat().id();
+        let offer = data.selection_offer();
+        self.clipboard.regular_selection_changed(&seat, offer);
+    }
 
     fn drop_performed(
         &mut self,
@@ -381,10 +385,10 @@ mod tests {
 
     #[test]
     fn reads_file_uris() {
-        assert_eq!(paths("file:///home/me/a.txt\r\nfile:///tmp/b%20c.png\r\n"), [
-            PathBuf::from("/home/me/a.txt"),
-            PathBuf::from("/tmp/b c.png")
-        ]);
+        assert_eq!(
+            paths("file:///home/me/a.txt\r\nfile:///tmp/b%20c.png\r\n"),
+            [PathBuf::from("/home/me/a.txt"), PathBuf::from("/tmp/b c.png")]
+        );
     }
 
     #[test]
@@ -402,10 +406,10 @@ mod tests {
 
     #[test]
     fn accepts_localhost_and_skips_other_hosts() {
-        assert_eq!(paths("file://localhost/a\r\nfile://LOCALHOST/b\r\nfile://elsewhere/c\r\n"), [
-            PathBuf::from("/a"),
-            PathBuf::from("/b")
-        ]);
+        assert_eq!(
+            paths("file://localhost/a\r\nfile://LOCALHOST/b\r\nfile://elsewhere/c\r\n"),
+            [PathBuf::from("/a"), PathBuf::from("/b")]
+        );
     }
 
     #[test]

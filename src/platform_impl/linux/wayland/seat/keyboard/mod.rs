@@ -63,7 +63,6 @@ impl Dispatch<WlKeyboard, KeyboardData, WinitState> for WinitState {
             },
             WlKeyboardEvent::Enter { surface, serial, .. } => {
                 let window_id = wayland::make_wid(&surface);
-                state.clipboard.note_input(&data.seat.id(), serial);
 
                 // Mark the window as focused.
                 let was_unfocused = match state.windows.get_mut().get(&window_id) {
@@ -83,6 +82,11 @@ impl Dispatch<WlKeyboard, KeyboardData, WinitState> for WinitState {
                 }
 
                 *data.window_id.lock().unwrap() = Some(window_id);
+                state.clipboard.keyboard_focus_enter(
+                    &data.seat.id(),
+                    serial,
+                    crate::window::WindowId(window_id),
+                );
 
                 // The keyboard focus is considered as general focus.
                 if was_unfocused {
@@ -99,6 +103,7 @@ impl Dispatch<WlKeyboard, KeyboardData, WinitState> for WinitState {
             },
             WlKeyboardEvent::Leave { surface, .. } => {
                 let window_id = wayland::make_wid(&surface);
+                state.clipboard.keyboard_focus_leave(&data.seat.id());
 
                 // NOTE: we should drop the repeat regardless whether it was for the present
                 // window of for the window which just went gone.
@@ -135,7 +140,13 @@ impl Dispatch<WlKeyboard, KeyboardData, WinitState> for WinitState {
             WlKeyboardEvent::Key {
                 key, serial, state: WEnum::Value(WlKeyState::Pressed), ..
             } => {
-                state.clipboard.note_input(&data.seat.id(), serial);
+                if let Some(window_id) = *data.window_id.lock().unwrap() {
+                    state.clipboard.keyboard_key(
+                        &data.seat.id(),
+                        serial,
+                        crate::window::WindowId(window_id),
+                    );
+                }
                 let key = key + 8;
 
                 key_input(

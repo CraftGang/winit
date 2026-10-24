@@ -1304,21 +1304,27 @@ impl Window {
     /// text, as when the text cursor moves to another field or the user clicks elsewhere in the
     /// text.
     ///
-    /// The composition is dropped, not committed (except on Wayland, see below), and the window
-    /// receives an empty [`Ime::Preedit`] if one was in progress. To keep the composed text, insert the last preedit
-    /// text before calling this. Has no effect while IME is not allowed.
+    /// The in-progress composition is cancelled where the platform allows it, and the window
+    /// receives an empty [`Ime::Preedit`] if one was visible. Text the input method has already
+    /// committed is not discarded: a [`Ime::Commit`] winit accepted before the reset is still
+    /// delivered, before the reset's preedit clear. To keep the composed text, insert the last
+    /// preedit text before calling this. Has no effect while IME is not allowed.
     ///
     /// ## Platform-specific
     ///
     /// - **X11:** Resets the window's input context (`XmbResetIC`).
     /// - **Wayland:** Disables and re-enables text input, then restores the purpose and cursor
-    ///   area. This discards the preedit where the input method allows: input methods set to
-    ///   commit on focus-out (an fcitx5 option) commit it instead.
+    ///   area. Records for the disabled generation are rejected, so the old composition is
+    ///   cancelled. An input method configured to commit when its text input is deactivated may
+    ///   send a commit, but winit only accepts it when the compositor assigns that `done` to the
+    ///   re-enabled generation; some compositors assign it to the disabled serial, where it is
+    ///   discarded. That commit is therefore not guaranteed.
     /// - **Windows:** Cancels the composition string (`ImmNotifyIME` with `CPS_CANCEL`).
     /// - **macOS:** Discards the marked text (`NSTextInputContext discardMarkedText`).
     /// - **iOS / Android / Web / Orbital:** Unsupported.
     ///
     /// [`Ime::Preedit`]: crate::event::Ime::Preedit
+    /// [`Ime::Commit`]: crate::event::Ime::Commit
     #[inline]
     pub fn reset_ime(&self) {
         let _span = tracing::debug_span!("winit::Window::reset_ime").entered();

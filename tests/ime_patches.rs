@@ -131,21 +131,205 @@ fn linux_reset_ime_discards_the_composition() {
     assert!(context.contains("(xconn.xlib.XmbResetIC)(self.ic)"), "X11 doesn't reset the context");
 
     let state = source("linux/wayland/window/state.rs");
-    let reset = section(&state, "pub fn reset_ime(&self) -> bool {", "\n    }\n");
-    let disable = reset.find("text_input.disable();").expect("Wayland reset doesn't disable");
-    let enable = reset.find("text_input.enable();").expect("Wayland reset doesn't enable");
+    let reset =
+        section(&state, "pub(crate) fn reset_ime(&mut self) -> ImeStateUpdate {", "\n    }\n");
     assert!(
-        reset[disable..enable].contains("text_input.commit();"),
-        "Wayland reset doesn't commit between disabling and enabling"
+        reset.contains("text_input.reset_with_state(&state);"),
+        "Wayland reset doesn't disable, enable and restore the IME state"
     );
+    // The wire order itself (`disable`/`commit`, `enable`, state, `commit`) is checked by the
+    // recording test in `text_input::tests::request_order_*`.
+    let text_input = source("linux/wayland/seat/text_input/mod.rs");
+    let reset_generation =
+        section(&text_input, "fn reset_generation<T: TextInputRequests>(", "\n}\n");
+    let disable_step = reset_generation
+        .find("disable_generation(input, data)")
+        .expect("reset doesn't disable first");
+    let enable_step = reset_generation
+        .find("enable_generation(input, data, state)")
+        .expect("reset doesn't enable after the disable");
+    assert!(disable_step < enable_step, "reset doesn't disable before it enables");
+    let enable_generation =
+        section(&text_input, "fn enable_generation<T: TextInputRequests>(", "\n}\n");
+    let enable = enable_generation.find("input.enable();").expect("enable isn't sent");
+    let state_step = enable_generation
+        .find("data.send_enabled_commit(input, state, Some(ImeTextChangeCause::Other))")
+        .expect("the reset state isn't applied and committed after enable");
     assert!(
-        reset[enable..].contains("self.apply_ime_state(text_input);"),
-        "Wayland reset doesn't restore the IME state"
+        enable < state_step,
+        "text-input-v3 enable doesn't precede the state it resets and its commit"
     );
-    let apply = section(&state, "pub fn apply_ime_state(", "\n    }\n");
-    for request in ["set_content_type_by_purpose", "set_cursor_rectangle", "set_surrounding_text"] {
+    let send_state = section(&text_input, "fn send_enabled_commit<", "\n    }\n");
+    let requests =
+        send_state.find("send_state_requests(").expect("the enabled state setters aren't sent");
+    let commit = send_state.find("input.commit();").expect("the enabled state isn't committed");
+    assert!(requests < commit, "the state setters don't precede their commit");
+    let snapshot = section(&state, "pub(crate) fn outgoing_ime_state(", "\n    }\n");
+    assert!(
+        snapshot.contains("OutgoingImeState::new(")
+            && snapshot.contains("self.ime_purpose")
+            && snapshot.contains("self.ime_cursor_area")
+            && snapshot.contains("self.ime_surrounding_text"),
+        "enabling text input doesn't rebuild the full outgoing snapshot"
+    );
+    let apply = section(&text_input, "fn send_state_requests<", "\n}\n");
+    for request in ["set_content_type", "set_cursor_rectangle", "set_surrounding_text"] {
         assert!(apply.contains(request), "enabling text input doesn't restore `{request}`");
     }
+}
+
+#[test]
+fn wayland_text_input_does_not_take_a_window_lock_under_the_data_lock() {
+    // `Window` is Send + Sync and `set_ime_allowed`/`reset_ime` may run on another thread. The
+    // data lock must be released before dispatch waits for the window-state lock; the reverse
+    // order (window lock held while taking the data lock) is the only permitted nesting.
+    let text_input = source("linux/wayland/seat/text_input/mod.rs");
+    let event = section(&text_input, "impl Dispatch<ZwpTextInputV3", "\n    }\n}\n");
+    let enter = section(event, "TextInputEvent::Enter", "TextInputEvent::Leave");
+    let data_lock = enter.find("data.inner.lock()").expect("enter doesn't set the owner");
+    let window_lock = enter.find("window.lock()").expect("enter doesn't lock the window");
+    assert!(data_lock < window_lock, "enter takes the window lock before the owner setup");
+    assert!(
+        enter[data_lock..window_lock].contains(";\n"),
+        "enter waits for a window lock while still holding the data lock"
+    );
+    for method in ["fn preedit_string(", "fn commit_string(", "fn delete_surrounding_text("] {
+        let body = section(&text_input, method, "\n    }\n");
+        assert!(
+            !body.contains("window.lock()") && !body.contains("windows.get"),
+            "{method} takes a window lock while handling incoming data"
+        );
+    }
+}
+
+#[test]
+fn wayland_ime_lifecycle_fences_late_incoming_events() {
+    // A disable or reset must not just clear the buffered fields: a `done`/`commit_string`
+    // already in flight would otherwise be applied after `Ime::Disabled`. Incoming changes are
+    // still applied for a `done` whose serial differs from the latest commit within the same
+    // enabled generation, as text-input-v3 requires.
+    let text_input = source("linux/wayland/seat/text_input/mod.rs");
+    let finish = section(&text_input, "fn finish_done_with_preedit_policy(", "\n    }\n");
+    assert!(
+        finish.contains("let Some(incoming_from) = self.incoming_from else {"),
+        "a late done is applied without a lifecycle generation"
+    );
+    assert!(
+        finish.contains("serial_at_least(done_serial, incoming_from)"),
+        "a done is gated on an exact serial match instead of the lifecycle fence"
+    );
+    assert!(
+        text_input.contains("fn serial_at_least(serial: u32, floor: u32) -> bool {")
+            && text_input.contains("serial.wrapping_sub(floor)"),
+        "the commit serial fence doesn't wrap"
+    );
+    let disable = section(&text_input, "fn disable_generation<T: TextInputRequests>(", "\n}\n");
+    let enable = section(&text_input, "fn enable_generation<T: TextInputRequests>(", "\n}\n");
+    assert!(
+        disable.contains("data.request_commit()"),
+        "disable doesn't account for its commit serial"
+    );
+    assert!(
+        enable.contains("data.send_enabled_commit(input, state, Some(ImeTextChangeCause::Other))"),
+        "enable doesn't account for its commit serial"
+    );
+    assert!(
+        disable.contains("end_incoming_generation()"),
+        "disabling leaves the old incoming generation active"
+    );
+    // Queued events are tagged with the generation and checked again at delivery.
+    assert!(
+        finish.contains("events.push_ime_event("),
+        "a delivered IME event isn't tagged with its lifecycle generation"
+    );
+    let sink = source("linux/wayland/event_loop/sink.rs");
+    let into_deliverable = section(&sink, "fn into_deliverable(", "\n    }\n");
+    assert!(
+        into_deliverable.contains("if !meta.token.allows(meta.committed_input)"),
+        "a stale queued IME event isn't checked at delivery"
+    );
+    assert!(
+        sink.contains("committed_input: bool") && sink.contains("fn push_ime_commit("),
+        "delivery doesn't distinguish accepted commit transactions from retractable composition state"
+    );
+    let enter = section(&text_input, "TextInputEvent::Enter", "TextInputEvent::Leave");
+    assert!(
+        enter.contains("previous_id != window_id")
+            && enter.contains("detach_input_from_window(&mut previous_window, text_input)"),
+        "enter without a prior leave can leave a stale window entry or preedit owner"
+    );
+    assert!(
+        enter.contains("push_window_event_at(") && enter.contains("WindowEvent::Ime(Ime::Enabled)"),
+        "enter's Enabled is still tied to the retractable generation token"
+    );
+
+    let event_loop = source("linux/wayland/event_loop/mod.rs");
+    assert!(
+        event_loop.contains("buffer_sink.append_ordered(&mut window_events);")
+            && event_loop.contains("buffer_sink.append_ordered(&mut state.events_sink);"),
+        "synthetic and compositor IME events aren't merged into one push order"
+    );
+    assert!(
+        event_loop.contains("drain_deliverable_for(|window_id|")
+            && event_loop.contains("requests.is_closed()"),
+        "queued IME events aren't checked against the window tombstone before delivery"
+    );
+}
+
+#[test]
+fn wayland_ime_teardown_is_per_window_and_cleans_a_removed_seat() {
+    // `enter` goes to every seat's text input on a window, so a leave from one seat must not
+    // report IME off for the others. The last leave, and a removed seat, still must clear the
+    // window's IME state instead of leaving a destroyed proxy in `text_inputs`.
+    let state = source("linux/wayland/window/state.rs");
+    let text_input_left = section(&state, "pub(crate) fn text_input_left(", "\n    }\n");
+    assert!(
+        text_input_left.contains("TextInputLeft::Last")
+            && text_input_left.contains("TextInputLeft::Remaining")
+            && text_input_left.contains("self.text_inputs.is_empty()"),
+        "leaving one of several seats can't be told apart from leaving the last one"
+    );
+
+    let text_input = source("linux/wayland/seat/text_input/mod.rs");
+    let leave = section(&text_input, "TextInputEvent::Leave", "TextInputEvent::PreeditString");
+    assert!(
+        leave.contains("push_ime_teardown(")
+            && leave.contains("detach_input_from_window(&mut window, text_input)"),
+        "leave emits a window-wide Disabled regardless of the remaining seats"
+    );
+    assert!(
+        leave.contains("data.inner.lock().unwrap().surface.clone()")
+            && leave.contains("stored_id")
+            && leave.contains("or_else"),
+        "leave trusts a nil/event surface instead of the stored owner or a fallback"
+    );
+    let teardown = section(&text_input, "pub(crate) fn push_ime_teardown(", "\n}\n");
+    assert!(
+        teardown.contains("if clear_preedit {")
+            && teardown.contains("left == TextInputLeft::Last && was_active"),
+        "the preedit clear and Disabled boundary aren't tracked separately"
+    );
+
+    let seat = source("linux/wayland/seat/mod.rs");
+    let remove_seat = section(&seat, "fn remove_seat(", "\n    }\n");
+    for cleanup in [
+        "data.end_owner()",
+        "window.text_input_left(&text_input)",
+        "window.ime_delete_surrounding = None",
+        "text_input.destroy()",
+        "push_ime_teardown(",
+    ] {
+        assert!(remove_seat.contains(cleanup), "removing a seat doesn't `{cleanup}`");
+    }
+    let detach = remove_seat
+        .find("window.text_input_left(&text_input)")
+        .expect("remove_seat never detaches the proxy");
+    let sample =
+        remove_seat.find("data.is_active()").expect("remove_seat never samples the old generation");
+    assert!(
+        detach < sample,
+        "remove_seat samples is_active before detaching under the window lock"
+    );
 }
 
 #[test]
@@ -154,16 +338,26 @@ fn wayland_surrounding_text_deletion_goes_with_a_commit() {
     // commit. winit 0.30's `Ime` has no deletion event, so the deletion is handed to the window
     // as its commit is delivered, and a deletion without a commit gets an empty one.
     let text_input = source("linux/wayland/seat/text_input/mod.rs");
-    let done = section(&text_input, "TextInputEvent::Done { .. } => {", "\n            },\n");
+    let done = section(&text_input, "TextInputEvent::Done { serial } => {", "\n            },\n");
     assert!(
-        done.contains("text_input_data.pending_commit = Some(String::new());"),
+        done.contains("finish_done_with_preedit_policy("),
+        "done doesn't apply the pending batch"
+    );
+    let batch = section(&text_input, "fn finish_done_with_preedit_policy(", "\n    }\n");
+    assert!(
+        batch.contains("self.batch.commit = Some(String::new());"),
         "a deletion without a commit isn't delivered"
     );
     assert!(
-        done.contains("state.ime_deletions.push_back(delete);"),
-        "commits don't queue their deletion"
+        batch.contains("events.push_ime_commit(text, owner, &token, delete);"),
+        "a commit doesn't carry its deletion or preedit-owner policy"
     );
     let event_loop = source("linux/wayland/event_loop/mod.rs");
+    assert!(
+        event_loop.contains("drain_deliverable_for(|window_id|")
+            && event_loop.contains("for (event, delete) in deliverable"),
+        "delivering doesn't use the lifecycle- and tombstone-aware queue entry"
+    );
     assert!(
         event_loop.contains("window.lock().unwrap().ime_delete_surrounding = delete;"),
         "delivering a commit doesn't hand its deletion to the window"
@@ -176,10 +370,85 @@ fn wayland_unchanged_surrounding_text_sends_nothing() {
     // ignore input-method commits against an older serial, so an app that sets the surrounding
     // text every frame would lose typed text.
     let state = source("linux/wayland/window/state.rs");
-    let set = section(&state, "pub fn set_ime_surrounding_text(", "\n    }\n");
-    let early_return = set.find("return;").expect("unchanged surrounding text is sent again");
-    let commit = set.find("text_input.commit();").expect("surrounding text isn't committed");
+    let set =
+        section(&state, "pub(crate) fn set_ime_surrounding_text_with_change_cause(", "\n    }\n");
+    assert!(
+        set.contains("if self.ime_purpose == ImePurpose::Password {"),
+        "a password field can publish surrounding text"
+    );
+    let early_return = set
+        .find("if self.ime_surrounding_text.as_ref().is_some_and(unchanged)")
+        .expect("unchanged surrounding text is sent again");
+    let commit = set
+        .find("text_input.sync_ime_state(&state, Some(cause))")
+        .expect("surrounding text isn't sent");
     assert!(early_return < commit, "unchanged surrounding text is sent again");
+}
+
+#[test]
+fn wayland_surrounding_text_clear_is_an_explicit_unavailable_context() {
+    // An available empty document and "unavailable" are different IME contexts. Only a committed
+    // disable/enable can make an already-published surrounding text unavailable again, and a
+    // disabled window must not be re-enabled by clearing.
+    let text_input = source("linux/wayland/seat/text_input/mod.rs");
+    assert!(
+        text_input.contains("ZwpTextInputV3::set_text_change_cause(self, cause);")
+            && text_input.contains("ImeTextChangeCause::Other => ChangeCause::Other"),
+        "the surrounding-text change cause isn't sent through text-input-v3"
+    );
+    let reset_needed = section(&text_input, "pub fn context_reset_needed(", "\n}\n");
+    assert!(
+        reset_needed.contains("ime_allowed")
+            && reset_needed.contains("has_entered_input")
+            && reset_needed.contains("has_pending_or_active_incoming")
+            && reset_needed.contains("had_surrounding_text")
+            && reset_needed.contains("has_visible_composition"),
+        "clearing ignores an active/buffered generation or resets a disabled context"
+    );
+    let state = source("linux/wayland/window/state.rs");
+    let needs = section(&state, "fn needs_context_reset(", "\n    }\n");
+    assert!(
+        needs.contains("context_reset_needed(")
+            && needs.contains("has_pending_or_active")
+            && needs.contains("TextInputData::has_pending_or_active")
+            && needs.contains("self.ime_preedit_owner.has_owner()"),
+        "clearing ignores pending incoming input or the visible composition"
+    );
+    let clear = section(&state, "fn clear_ime_context(", "\n    }\n");
+    assert!(clear.contains("self.needs_context_reset("), "clearing has no guard");
+    assert!(
+        clear.contains("text_input.reset_with_state(&state);"),
+        "unavailable surrounding text isn't invalidated with a committed reset"
+    );
+    assert!(
+        clear.contains("self.outgoing_ime_state()"),
+        "the reset doesn't resend the remaining IME state"
+    );
+    let public = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/platform/wayland.rs"),
+    )
+    .expect("platform/wayland.rs is readable");
+    assert!(
+        public.contains("fn clear_ime_surrounding_text(&self);"),
+        "WindowExtWayland has no explicit unavailable-context API"
+    );
+    let external_default = section(
+        &public,
+        "fn set_ime_surrounding_text(&self, text: &str, cursor: usize, anchor: usize) {",
+        "\n    }\n",
+    );
+    assert!(
+        external_default.contains("ImeTextChangeCause::Other")
+            && public.contains("fn set_ime_surrounding_text_with_change_cause(")
+            && public.contains("best-effort on the wire"),
+        "the public setter doesn't report an external cause or qualify available-empty"
+    );
+    let window = source("linux/wayland/window/mod.rs");
+    let cursor = section(&window, "pub fn set_ime_cursor_area(", "\n    }\n");
+    assert!(
+        !cursor.contains("if window_state.ime_allowed()"),
+        "a cursor area set while IME is disabled is discarded"
+    );
 }
 
 #[test]
@@ -395,6 +664,98 @@ fn macos_reset_ime_discards_the_composition() {
     );
     let delegate = source("macos/window_delegate.rs");
     assert!(delegate.contains("self.view().reset_ime();"), "reset_ime isn't passed to the view");
+}
+
+#[test]
+fn wayland_window_level_composition_and_delivery_seams_are_guarded() {
+    // The public IME stream identifies a window, not a seat. Every accepted commit must emit the
+    // documented empty Preedit before the commit and release the old visible owner; a non-owner
+    // empty preedit must not clear or steal it. The event loop must recheck the closed-window
+    // tombstone immediately before each callback, and all protocol state requests must wake the
+    // loop even when no visible preedit produces a callback event.
+    let text_input = source("linux/wayland/seat/text_input/mod.rs");
+    let sink = source("linux/wayland/event_loop/sink.rs");
+    let commit = section(&sink, "pub(crate) fn push_ime_commit(", "\n    }\n");
+    assert!(
+        commit.contains("Ime::Preedit(String::new(), None)") && !commit.contains("clear_preedit"),
+        "push_ime_commit can omit the public clear before a non-owner commit"
+    );
+    let apply = section(&text_input, "fn finish_done_with_preedit_policy(", "\n    }\n");
+    assert!(
+        apply.contains("events.push_ime_commit(text, owner, &token, delete);")
+            && apply.contains("if !outcome.committed && may_clear_preedit"),
+        "the done reducer no longer separates commit clears from non-owner empty preedits"
+    );
+    let state = source("linux/wayland/window/state.rs");
+    assert!(
+        state.contains("pub(crate) fn after_done(")
+            && state.contains("if outcome.committed {\n            self.owner = None;"),
+        "a commit does not release the visible preedit owner"
+    );
+
+    let event_loop = source("linux/wayland/event_loop/mod.rs");
+    let deliverable = section(
+        &event_loop,
+        "for (event, delete) in deliverable {",
+        "callback(event, &self.window_target);",
+    );
+    assert!(
+        deliverable.contains("ime_window.is_some_and")
+            && deliverable.contains("requests.is_closed()")
+            && deliverable.contains("continue;"),
+        "the tombstone is checked only while draining, not immediately before each callback"
+    );
+
+    let purpose = section(&state, "pub(crate) fn set_ime_purpose(", "\n    }\n");
+    assert!(
+        purpose.contains("if !changed {") && purpose.contains("return ImeStateUpdate::default();"),
+        "reasserting the same purpose can reset a password context every frame"
+    );
+
+    let window = source("linux/wayland/window/mod.rs");
+    assert!(
+        window.contains("fn wake_for_ime_state(")
+            && window.contains("if update.sent {")
+            && window.contains("self.wake_for_ime_state(update);"),
+        "a background-thread IME protocol request can remain unflushed"
+    );
+    assert!(
+        !text_input.contains("push_ime_event_at(\n                        sequence,\n                        Ime::Enabled"),
+        "Enabled is still tagged as retractable composition"
+    );
+}
+
+#[test]
+fn wayland_window_close_keeps_ime_and_selection_cleanup() {
+    // W27's closed-window cleanup and W15P's per-window selection cleanup meet on the same close
+    // branch, while W27 removed the global IME deletion deque where W15P stores its raw PRIMARY
+    // offer. Keep both close calls, per-turn reconciliation and the field split: dropping either
+    // leaves stale IME batches or selection reads bound to a dead window.
+    let event_loop = source("linux/wayland/event_loop/mod.rs");
+    let close = section(
+        &event_loop,
+        "if window_requests.get(window_id).unwrap().take_closed() {",
+        "return Some(WindowEvent::Destroyed);",
+    );
+    assert!(
+        close.contains("clear_ime_batch_for_window(&state.seats, *window_id);"),
+        "closing a window drops its queued IME batch"
+    );
+    assert!(
+        close.contains("state.clipboard.remove_window(crate::window::WindowId(*window_id));"),
+        "closing a window leaves clipboard reads attached to it"
+    );
+    assert!(
+        event_loop.contains("self.with_state(|state| state.clipboard.reconcile_selections());"),
+        "the event-loop turn doesn't reconcile cleared selections"
+    );
+
+    let state = source("linux/wayland/state.rs");
+    assert!(
+        state.contains("pub pending_primary_offer: Option<ZwpPrimarySelectionOfferV1>"),
+        "the PRIMARY raw-offer side channel is missing"
+    );
+    assert!(!state.contains("ime_deletions"), "the old global IME deletion deque was reintroduced");
 }
 
 // `ImeStartup` and `ImeDocument` are plain Rust, so their tests run on every platform.

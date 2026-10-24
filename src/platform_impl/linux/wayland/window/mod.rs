@@ -186,6 +186,7 @@ impl Window {
         let window_state = Arc::new(Mutex::new(window_state));
         let window_id = super::make_wid(&surface);
         state.windows.get_mut().insert(window_id, window_state.clone());
+        state.clipboard.add_window(crate::window::WindowId(window_id));
 
         let window_requests = WindowRequests {
             redraw_requested: AtomicBool::new(true),
@@ -598,36 +599,95 @@ impl Window {
         }
     }
 
+    /// Wake the event loop when an IME operation wrote a protocol request.
+    ///
+    /// A protocol request from a background thread is not visible to the loop by itself. Even a
+    /// clear/reset/purpose transition with no visible preedit must flush its disable/enable/commit
+    /// instead of waiting for an unrelated event.
+    fn wake_for_ime_state(
+        &self,
+        update: crate::platform_impl::linux::wayland::window::state::ImeStateUpdate,
+    ) {
+        if update.sent {
+            self.event_loop_awakener.ping();
+        }
+    }
+
     #[inline]
     pub fn set_ime_cursor_area(&self, position: Position, size: Size) {
         let mut window_state = self.window_state.lock().unwrap();
-        if window_state.ime_allowed() {
-            let scale_factor = window_state.scale_factor();
-            let position = position.to_logical(scale_factor);
-            let size = size.to_logical(scale_factor);
-            window_state.set_ime_cursor_area(position, size);
-        }
+        // Keep the desired area even while IME is disabled: a later enable must publish the
+        // current field's caret, not the area cached before focus moved.
+        let scale_factor = window_state.scale_factor();
+        let position = position.to_logical(scale_factor);
+        let size = size.to_logical(scale_factor);
+        let update = window_state.set_ime_cursor_area(position, size);
+        drop(window_state);
+        self.wake_for_ime_state(update);
     }
 
     #[inline]
     pub fn set_ime_allowed(&self, allowed: bool) {
         let mut window_state = self.window_state.lock().unwrap();
 
-        if window_state.ime_allowed() != allowed && window_state.set_ime_allowed(allowed) {
-            let event = WindowEvent::Ime(if allowed { Ime::Enabled } else { Ime::Disabled });
-            self.window_events_sink.lock().unwrap().push_window_event(event, self.window_id);
-            self.event_loop_awakener.ping();
+        if window_state.ime_allowed() != allowed {
+            let update = window_state.set_ime_allowed(allowed);
+            drop(window_state);
+            if let Some(sequence) = update.boundary {
+                let event = WindowEvent::Ime(if allowed { Ime::Enabled } else { Ime::Disabled });
+                self.window_events_sink.lock().unwrap().push_window_event_at(
+                    sequence,
+                    event,
+                    self.window_id,
+                );
+            }
+            self.wake_for_ime_state(update);
         }
     }
 
     #[inline]
     pub fn set_ime_purpose(&self, purpose: ImePurpose) {
-        self.window_state.lock().unwrap().set_ime_purpose(purpose);
+        let mut window_state = self.window_state.lock().unwrap();
+        let update = window_state.set_ime_purpose(purpose);
+        drop(window_state);
+        if let Some(sequence) = update.boundary {
+            self.window_events_sink.lock().unwrap().push_window_event_at(
+                sequence,
+                WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+                self.window_id,
+            );
+        }
+        self.wake_for_ime_state(update);
     }
 
     #[inline]
-    pub fn set_ime_surrounding_text(&self, text: &str, cursor: usize, anchor: usize) {
-        self.window_state.lock().unwrap().set_ime_surrounding_text(text, cursor, anchor);
+    pub fn set_ime_surrounding_text_with_change_cause(
+        &self,
+        text: &str,
+        cursor: usize,
+        anchor: usize,
+        cause: crate::platform::wayland::ImeTextChangeCause,
+    ) {
+        let mut window_state = self.window_state.lock().unwrap();
+        let update =
+            window_state.set_ime_surrounding_text_with_change_cause(text, cursor, anchor, cause);
+        drop(window_state);
+        self.wake_for_ime_state(update);
+    }
+
+    #[inline]
+    pub fn clear_ime_surrounding_text(&self) {
+        let mut window_state = self.window_state.lock().unwrap();
+        let update = window_state.clear_ime_surrounding_text();
+        drop(window_state);
+        if let Some(sequence) = update.boundary {
+            self.window_events_sink.lock().unwrap().push_window_event_at(
+                sequence,
+                WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+                self.window_id,
+            );
+        }
+        self.wake_for_ime_state(update);
     }
 
     #[inline]
@@ -639,11 +699,19 @@ impl Window {
 
     #[inline]
     pub fn reset_ime(&self) {
-        let window_state = self.window_state.lock().unwrap();
-        if window_state.ime_allowed() && window_state.reset_ime() {
-            let event = WindowEvent::Ime(Ime::Preedit(String::new(), None));
-            self.window_events_sink.lock().unwrap().push_window_event(event, self.window_id);
-            self.event_loop_awakener.ping();
+        let mut window_state = self.window_state.lock().unwrap();
+        if window_state.ime_allowed() {
+            let update = window_state.reset_ime();
+            drop(window_state);
+            if let Some(sequence) = update.boundary {
+                let event = WindowEvent::Ime(Ime::Preedit(String::new(), None));
+                self.window_events_sink.lock().unwrap().push_window_event_at(
+                    sequence,
+                    event,
+                    self.window_id,
+                );
+            }
+            self.wake_for_ime_state(update);
         }
     }
 
@@ -739,7 +807,7 @@ impl Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
-        self.window_requests.closed.store(true, Ordering::Relaxed);
+        self.window_requests.closed.store(true, Ordering::Release);
         self.event_loop_awakener.ping();
     }
 }
@@ -755,8 +823,16 @@ pub struct WindowRequests {
 }
 
 impl WindowRequests {
+    /// Whether the application has dropped the window.
+    ///
+    /// The event loop reads this before delivering every queued IME event. It is a window-scoped
+    /// tombstone that does not depend on a seat's text-input object still being alive.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     pub fn take_closed(&self) -> bool {
-        self.closed.swap(false, Ordering::Relaxed)
+        self.closed.swap(false, Ordering::AcqRel)
     }
 
     pub fn take_redraw_requested(&self) -> bool {

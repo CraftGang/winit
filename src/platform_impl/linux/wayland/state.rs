@@ -2,8 +2,6 @@ use std::cell::RefCell;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use crate::platform::wayland::ImeDeleteSurrounding;
-
 use ahash::AHashMap;
 
 use sctk::reexports::calloop::LoopHandle;
@@ -12,10 +10,13 @@ use sctk::reexports::client::globals::GlobalList;
 use sctk::reexports::client::protocol::wl_output::WlOutput;
 use sctk::reexports::client::protocol::wl_surface::WlSurface;
 use sctk::reexports::client::{Connection, Proxy, QueueHandle};
+use sctk::reexports::protocols::wp::primary_selection::zv1::client::zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1;
+use sctk::reexports::protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
 
 use sctk::compositor::{CompositorHandler, CompositorState};
 use sctk::data_device_manager::DataDeviceManagerState;
 use sctk::output::{OutputHandler, OutputState};
+use sctk::primary_selection::PrimarySelectionManagerState;
 use sctk::registry::{ProvidesRegistryState, RegistryState};
 use sctk::seat::pointer::ThemedPointer;
 use sctk::seat::SeatState;
@@ -102,8 +103,11 @@ pub struct WinitState {
     /// event loop run.
     pub events_sink: EventSink,
 
-    /// The surrounding text deletion that goes with each `Ime::Commit` in `events_sink`, in order.
-    pub ime_deletions: std::collections::VecDeque<Option<ImeDeleteSurrounding>>,
+    /// Raw PRIMARY offer from the selection event currently being forwarded to SCTK's device
+    /// dispatch. The `PrimarySelectionDeviceHandler` callback consumes it immediately so the
+    /// wrapper and its raw proxy are stored under one clipboard lock. It is not a second source
+    /// of protocol ownership: SCTK still owns offer lifetime.
+    pub pending_primary_offer: Option<ZwpPrimarySelectionOfferV1>,
 
     /// Xdg activation.
     pub xdg_activation: Option<XdgActivationState>,
@@ -162,17 +166,45 @@ impl WinitState {
             Ok(manager) => Some(manager),
             Err(e) => {
                 tracing::warn!(
-                    "Data device manager not available, ignoring file drops and the clipboard: \
-                     {e:?}"
+                    "Data device manager not available, ignoring file drops and the regular \
+                     clipboard (PRIMARY selection has its own protocol): {e:?}"
                 );
                 None
             },
+        };
+
+        let primary_selection_manager_state = {
+            // The old `zwp_primary_selection_manager_v1` spelling never matches a real global
+            // and made the advertised-but-unbound diagnostic unreachable. Use the generated
+            // protocol interface name so this cannot drift again.
+            let primary_interface = ZwpPrimarySelectionDeviceManagerV1::interface().name;
+            let advertised = globals
+                .contents()
+                .with_list(|list| list.iter().any(|global| global.interface == primary_interface));
+            match PrimarySelectionManagerState::bind(globals, queue_handle) {
+                Ok(manager) => Some(Arc::new(manager)),
+                Err(error) => {
+                    if advertised {
+                        // A global that cannot be bound is a real failure, not a compositor
+                        // without PRIMARY support.
+                        tracing::warn!(
+                            "PRIMARY selection was advertised but could not be bound: {error:?}"
+                        );
+                    } else {
+                        tracing::debug!(
+                            "PRIMARY selection is unavailable on this compositor: {error:?}"
+                        );
+                    }
+                    None
+                },
+            }
         };
 
         let clipboard = ClipboardState::new(
             connection,
             queue_handle,
             data_device_manager_state.as_ref().map(|manager| manager.data_device_manager().clone()),
+            primary_selection_manager_state,
         );
 
         let mut seats = AHashMap::default();
@@ -180,9 +212,11 @@ impl WinitState {
             let data_device = data_device_manager_state
                 .as_ref()
                 .map(|manager| manager.get_data_device(queue_handle, &seat));
-            if let Some(data_device) = &data_device {
-                clipboard.add_seat(seat.id(), data_device.inner().clone());
-            }
+            clipboard.add_seat(
+                &seat,
+                data_device.as_ref().map(|device| device.inner().clone()),
+                queue_handle,
+            );
             seats.insert(seat.id(), WinitSeatState::new(data_device));
         }
 
@@ -229,7 +263,7 @@ impl WinitState {
 
             monitors: Arc::new(Mutex::new(monitors)),
             events_sink: EventSink::new(),
-            ime_deletions: Default::default(),
+            pending_primary_offer: None,
             loop_handle,
             // Make it true by default.
             dispatched_events: true,

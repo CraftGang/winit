@@ -38,6 +38,7 @@ pub mod sink;
 pub use proxy::EventLoopProxy;
 use sink::EventSink;
 
+use super::seat::clear_ime_batch_for_window;
 use super::state::{WindowCompositorUpdate, WinitState};
 use super::window::state::FrameCallbackState;
 use super::{logical_to_physical_rounded, DeviceId, WaylandError, WindowId};
@@ -449,28 +450,57 @@ impl<T: 'static> EventLoop<T> {
             }
         }
 
-        // Push the events directly from the window.
+        // Merge the synthetic events pushed by the window and the compositor events into the
+        // process-wide push order before delivering either. The two sinks are needed because the
+        // window side cannot borrow `WinitState`, but delivering all synthetic events first made
+        // a `Disabled` overtake a `Commit` the compositor had already accepted. The merge takes
+        // only the window sink's mutex, releases it and the state borrow before callbacks run.
         self.with_state(|state| {
-            buffer_sink.append(&mut state.window_events_sink.lock().unwrap());
+            let mut window_events = state.window_events_sink.lock().unwrap();
+            buffer_sink.append_ordered(&mut window_events);
+            buffer_sink.append_ordered(&mut state.events_sink);
         });
-        for event in buffer_sink.drain() {
-            let event = event.map_nonuser_event().unwrap();
-            callback(event, &self.window_target);
-        }
-
-        // Handle non-synthetic events.
-        self.with_state(|state| {
-            buffer_sink.append(&mut state.events_sink);
+        // Check the window's closed tombstone immediately before delivery. Window destruction is
+        // asynchronous with dispatch, so checking only after the queue was drained delivered IME
+        // events for a window the application had already dropped. This also covers accepted
+        // commits whose seat was destroyed (their lifecycle token survives in the queued event)
+        // and untagged synthetic `Enabled`/clear events.
+        let deliverable = buffer_sink.drain_deliverable_for(|window_id| {
+            self.with_state(|state| {
+                state
+                    .window_requests
+                    .get_mut()
+                    .get(&window_id)
+                    .map_or(true, |requests| requests.is_closed())
+            })
         });
-        for event in buffer_sink.drain() {
+        for (event, delete) in deliverable {
             let event = event.map_nonuser_event().unwrap();
+            // Recheck the tombstone immediately before every callback, not only while draining.
+            // Another thread can close and drop the window after the drain filtered the queue but
+            // before this callback runs.
+            let ime_window = match &event {
+                Event::WindowEvent { window_id, event: WindowEvent::Ime(_) } => Some(window_id.0),
+                _ => None,
+            };
+            if ime_window.is_some_and(|window_id| {
+                self.with_state(|state| {
+                    state
+                        .window_requests
+                        .get_mut()
+                        .get(&window_id)
+                        .map_or(true, |requests| requests.is_closed())
+                })
+            }) {
+                continue;
+            }
             // Hand the window the deletion that goes with this commit, for
-            // `WindowExtWayland::take_ime_delete_surrounding`.
+            // `WindowExtWayland::take_ime_delete_surrounding`. The deletion travels with its
+            // commit event, so another window's commit cannot consume it.
             if let Event::WindowEvent { window_id, event: WindowEvent::Ime(Ime::Commit(_)) } =
                 &event
             {
                 self.with_state(|state| {
-                    let delete = state.ime_deletions.pop_front().flatten();
                     if let Some(window) = state.windows.get_mut().get(&window_id.0) {
                         window.lock().unwrap().ime_delete_surrounding = delete;
                     }
@@ -490,6 +520,8 @@ impl<T: 'static> EventLoop<T> {
                 if window_requests.get(window_id).unwrap().take_closed() {
                     mem::drop(window_requests.remove(window_id));
                     mem::drop(state.windows.get_mut().remove(window_id));
+                    clear_ime_batch_for_window(&state.seats, *window_id);
+                    state.clipboard.remove_window(crate::window::WindowId(*window_id));
                     return Some(WindowEvent::Destroyed);
                 }
 
@@ -518,6 +550,10 @@ impl<T: 'static> EventLoop<T> {
                 );
             }
         }
+
+        // SCTK does not report `wl_data_device.selection(NULL)`, so reconcile the protocol
+        // objects once per turn to notice a regular selection clear and cancel stale reads.
+        self.with_state(|state| state.clipboard.reconcile_selections());
 
         // Reset the hint that we've dispatched events.
         self.with_state(|state| {
