@@ -29,7 +29,7 @@ use crate::event_loop::ActiveEventLoop as RootAEL;
 use crate::keyboard::ModifiersState;
 use crate::platform_impl::common::xkb::{self, XkbState};
 use crate::platform_impl::platform::common::xkb::Context;
-use crate::platform_impl::platform::x11::ime::{ImeEvent, ImeEventReceiver, ImeRequest};
+use crate::platform_impl::platform::x11::ime::{CompositionState, ImeEventReceiver, ImeRequest};
 use crate::platform_impl::platform::x11::ActiveEventLoop;
 use crate::platform_impl::platform::ActiveEventLoop as PlatformActiveEventLoop;
 use crate::platform_impl::x11::atoms::*;
@@ -72,7 +72,7 @@ pub struct EventProcessor {
     // delivered at near the same time.
     pub xfiltered_modifiers: VecDeque<u8>,
     pub xmodmap: util::ModifierKeymap,
-    pub is_composing: bool,
+    pub(crate) ime_compositions: CompositionState,
     /// The latest IME spot requested for each window, not yet sent to the input method.
     pub ime_spots: HashMap<XWindow, (i16, i16)>,
     /// Until when the input method may still be answering the keys it was given.
@@ -127,45 +127,33 @@ impl EventProcessor {
     {
         // Requests made since the last event go first: a reset or allow request made when focus
         // moved to another field has to reach the input method before the next key does.
-        self.handle_ime_requests(&mut callback);
+        self.handle_ime_requests();
+        // The reset fence shares the XIM callback channel. Deliver it before processing the
+        // next native event, which can itself synchronously deliver a new commit.
+        self.drain_ime_events(&mut callback);
         self.process_xevent(xev, &mut callback);
-        self.handle_ime_requests(&mut callback);
-
-        // Drain IME events.
-        while let Ok((window, event)) = self.ime_event_receiver.try_recv() {
-            let window_id = mkwid(window as xproto::Window);
-            let event = match event {
-                ImeEvent::Enabled => WindowEvent::Ime(Ime::Enabled),
-                ImeEvent::Start => {
-                    self.is_composing = true;
-                    WindowEvent::Ime(Ime::Preedit("".to_owned(), None))
-                },
-                ImeEvent::Update(text, position) if self.is_composing => {
-                    WindowEvent::Ime(Ime::Preedit(text, Some((position, position))))
-                },
-                ImeEvent::End => {
-                    self.is_composing = false;
-                    // Issue empty preedit on `Done`.
-                    WindowEvent::Ime(Ime::Preedit(String::new(), None))
-                },
-                ImeEvent::Disabled => {
-                    self.is_composing = false;
-                    WindowEvent::Ime(Ime::Disabled)
-                },
-                _ => continue,
-            };
-
-            callback(&self.target, Event::WindowEvent { window_id, event });
-        }
+        self.handle_ime_requests();
+        self.drain_ime_events(&mut callback);
     }
 
-    fn handle_ime_requests<T: 'static, F>(&mut self, callback: &mut F)
+    fn drain_ime_events<T: 'static, F>(&mut self, callback: &mut F)
     where
         F: FnMut(&RootAEL, Event<T>),
     {
+        while let Ok((window, event)) = self.ime_event_receiver.try_recv() {
+            let window_id = mkwid(window as xproto::Window);
+            for event in self.ime_compositions.handle(window, event).into_iter().flatten() {
+                callback(&self.target, Event::WindowEvent { window_id, event });
+            }
+            // A callback can switch the edit target and request another reset. Establish it
+            // before the next native event, while preserving the callback channel's order.
+            self.handle_ime_requests();
+        }
+    }
+
+    fn handle_ime_requests(&mut self) {
         let window_target = Self::window_target_mut(&mut self.target);
 
-        let mut reset_windows = Vec::new();
         while let Ok(request) = self.ime_receiver.try_recv() {
             let ime = match window_target.ime.as_mut() {
                 Some(ime) => ime,
@@ -191,24 +179,17 @@ impl EventProcessor {
                     }
                 },
                 ImeRequest::Reset(window_id) if ime.is_ime_allowed(window_id) => {
-                    if let Ok(true) = ime.reset(window_id) {
-                        reset_windows.push(window_id);
-                    }
+                    let _ = ime.reset_with_request(window_id, None);
                 },
-                ImeRequest::Reset(_) => {},
+                ImeRequest::ResetWithRequest(window_id, request_id)
+                    if ime.is_ime_allowed(window_id) =>
+                {
+                    let _ = ime.reset_with_request(window_id, Some(request_id));
+                },
+                ImeRequest::Reset(_) | ImeRequest::ResetWithRequest(..) => {},
             }
         }
         self.send_ime_spots();
-
-        // Input methods don't always end the preedit they discard on reset.
-        for window in reset_windows {
-            if self.is_composing {
-                self.is_composing = false;
-                let event = WindowEvent::Ime(Ime::Preedit(String::new(), None));
-                let window_id = mkwid(window as xproto::Window);
-                callback(&self.target, Event::WindowEvent { window_id, event });
-            }
-        }
     }
 
     /// XFilterEvent tells us when an event has been discarded by the input method.
@@ -764,10 +745,10 @@ impl EventProcessor {
             drop(shared_state_lock);
 
             if moved {
-                callback(
-                    &self.target,
-                    Event::WindowEvent { window_id, event: WindowEvent::Moved(outer.into()) },
-                );
+                callback(&self.target, Event::WindowEvent {
+                    window_id,
+                    event: WindowEvent::Moved(outer.into()),
+                });
             }
             outer
         };
@@ -812,16 +793,13 @@ impl EventProcessor {
                 drop(shared_state_lock);
 
                 let inner_size = Arc::new(Mutex::new(new_inner_size));
-                callback(
-                    &self.target,
-                    Event::WindowEvent {
-                        window_id,
-                        event: WindowEvent::ScaleFactorChanged {
-                            scale_factor: new_scale_factor,
-                            inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&inner_size)),
-                        },
+                callback(&self.target, Event::WindowEvent {
+                    window_id,
+                    event: WindowEvent::ScaleFactorChanged {
+                        scale_factor: new_scale_factor,
+                        inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&inner_size)),
                     },
-                );
+                });
 
                 let new_inner_size = *inner_size.lock().unwrap();
                 drop(inner_size);
@@ -868,13 +846,10 @@ impl EventProcessor {
         }
 
         if resized {
-            callback(
-                &self.target,
-                Event::WindowEvent {
-                    window_id,
-                    event: WindowEvent::Resized(new_inner_size.into()),
-                },
-            );
+            callback(&self.target, Event::WindowEvent {
+                window_id,
+                event: WindowEvent::Resized(new_inner_size.into()),
+            });
         }
     }
 
@@ -911,7 +886,7 @@ impl EventProcessor {
         callback(&self.target, event);
     }
 
-    fn destroy_notify<T: 'static, F>(&self, xev: &XDestroyWindowEvent, mut callback: F)
+    fn destroy_notify<T: 'static, F>(&mut self, xev: &XDestroyWindowEvent, mut callback: F)
     where
         F: FnMut(&RootAEL, Event<T>),
     {
@@ -919,6 +894,8 @@ impl EventProcessor {
 
         let window = xev.window as xproto::Window;
         let window_id = mkwid(window);
+
+        self.ime_compositions.end(window as XWindow);
 
         // In the event that the window's been destroyed without being dropped first, we
         // cleanup again here.
@@ -1056,7 +1033,7 @@ impl EventProcessor {
             self.update_mods_from_core_event(window_id, xev.state as u16, &mut callback);
         }
 
-        if keycode != 0 && !self.is_composing {
+        if keycode != 0 && !self.ime_compositions.is_composing(window as XWindow) {
             // Don't alter the modifiers state from replaying.
             if replay {
                 self.send_synthic_modifier_from_core(window_id, xev.state as u16, &mut callback);
@@ -1095,7 +1072,7 @@ impl EventProcessor {
                 let event =
                     Event::WindowEvent { window_id, event: WindowEvent::Ime(Ime::Commit(written)) };
 
-                self.is_composing = false;
+                self.ime_compositions.end(window as XWindow);
                 callback(&self.target, event);
             }
         }
@@ -1596,13 +1573,10 @@ impl EventProcessor {
         }
         let physical_key = xkb::raw_keycode_to_physicalkey(keycode);
 
-        callback(
-            &self.target,
-            Event::DeviceEvent {
-                device_id,
-                event: DeviceEvent::Key(RawKeyEvent { physical_key, state }),
-            },
-        );
+        callback(&self.target, Event::DeviceEvent {
+            device_id,
+            event: DeviceEvent::Key(RawKeyEvent { physical_key, state }),
+        });
     }
 
     fn xinput2_hierarchy_changed<T: 'static, F>(&mut self, xev: &XIHierarchyEvent, mut callback: F)
@@ -1617,21 +1591,15 @@ impl EventProcessor {
         for info in infos {
             if 0 != info.flags & (xinput2::XISlaveAdded | xinput2::XIMasterAdded) {
                 self.init_device(info.deviceid as xinput::DeviceId);
-                callback(
-                    &self.target,
-                    Event::DeviceEvent {
-                        device_id: mkdid(info.deviceid as xinput::DeviceId),
-                        event: DeviceEvent::Added,
-                    },
-                );
+                callback(&self.target, Event::DeviceEvent {
+                    device_id: mkdid(info.deviceid as xinput::DeviceId),
+                    event: DeviceEvent::Added,
+                });
             } else if 0 != info.flags & (xinput2::XISlaveRemoved | xinput2::XIMasterRemoved) {
-                callback(
-                    &self.target,
-                    Event::DeviceEvent {
-                        device_id: mkdid(info.deviceid as xinput::DeviceId),
-                        event: DeviceEvent::Removed,
-                    },
-                );
+                callback(&self.target, Event::DeviceEvent {
+                    device_id: mkdid(info.deviceid as xinput::DeviceId),
+                    event: DeviceEvent::Removed,
+                });
                 let mut devices = self.devices.borrow_mut();
                 devices.remove(&DeviceId(info.deviceid as xinput::DeviceId));
             }

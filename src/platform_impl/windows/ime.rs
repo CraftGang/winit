@@ -154,8 +154,18 @@ impl ImeContext {
 
     /// Asks the IME to discard the composition (`NI_COMPOSITIONSTR`, `CPS_CANCEL`). Which
     /// composition messages the IME sends in response, if any, depends on the IME.
-    pub unsafe fn cancel_composition(&self) {
-        unsafe { ImmNotifyIME(self.himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0) };
+    pub unsafe fn cancel_composition(&self) -> bool {
+        unsafe { ImmNotifyIME(self.himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0) != 0 }
+    }
+
+    /// Establishes cancellation, including a successful empty-context no-op. CPS_CANCEL's
+    /// boolean return is not documented to distinguish "already empty" from a failure.
+    pub unsafe fn reset_composition(&self) -> bool {
+        if self.himc == 0 {
+            return false;
+        }
+        let size = unsafe { ImmGetCompositionStringW(self.himc, GCS_COMPSTR, null_mut(), 0) };
+        composition_reset_succeeded(size, || unsafe { self.cancel_composition() })
     }
 
     pub unsafe fn set_ime_allowed(hwnd: HWND, allowed: bool) {
@@ -195,8 +205,32 @@ impl ImeContext {
     }
 }
 
+fn composition_reset_succeeded(size: i32, cancel: impl FnOnce() -> bool) -> bool {
+    // Zero is a successful empty-string query. Negative IMM_ERROR_NODATA/GENERAL values are
+    // not evidence of an empty context; they still require a successful cancellation.
+    size == 0 || cancel()
+}
+
 impl Drop for ImeContext {
     fn drop(&mut self) {
         unsafe { ImmReleaseContext(self.hwnd, self.himc) };
+    }
+}
+
+#[cfg(test)]
+mod reset_tests {
+    use super::composition_reset_succeeded;
+
+    #[test]
+    fn empty_context_reset_is_a_noop_even_if_cancel_would_report_false() {
+        assert!(composition_reset_succeeded(0, || panic!("empty context must not need notify")));
+    }
+
+    #[test]
+    fn nonempty_or_unavailable_context_needs_successful_cancellation() {
+        for size in [2, -1, -2] {
+            assert!(!composition_reset_succeeded(size, || false));
+            assert!(composition_reset_succeeded(size, || true));
+        }
     }
 }

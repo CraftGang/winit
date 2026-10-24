@@ -113,10 +113,7 @@ impl QueuedEvent {
     /// Synthetic `Enabled`/`Disabled`/clear events have no lifecycle token, so the closed-window
     /// tombstone must be checked for them too.
     pub(crate) fn ime_window(&self) -> Option<WindowId> {
-        match &self.event {
-            Event::WindowEvent { window_id, event: WindowEvent::Ime(_) } => Some(window_id.0),
-            _ => None,
-        }
+        ime_event_window(&self.event)
     }
 
     /// Returns the event and the deletion that goes with it, or `None` if its lifecycle
@@ -132,6 +129,17 @@ impl QueuedEvent {
             None => None,
         };
         Some((self.event, delete))
+    }
+}
+
+/// Classify native IME input and completion controls at both drain and callback boundaries.
+pub(crate) fn ime_event_window<T: 'static>(event: &Event<T>) -> Option<WindowId> {
+    match event {
+        Event::WindowEvent {
+            window_id,
+            event: WindowEvent::Ime(_) | WindowEvent::ImeResetCompleted { .. },
+        } => Some(window_id.0),
+        _ => None,
     }
 }
 
@@ -342,5 +350,24 @@ mod tests {
         assert_eq!(checked_next_sequence(0), Some(1));
         assert_eq!(checked_next_sequence(u64::MAX - 1), Some(u64::MAX));
         assert_eq!(checked_next_sequence(u64::MAX), None);
+    }
+
+    #[test]
+    fn reset_completion_is_window_scoped_and_dropped_after_window_closure() {
+        use crate::event::{Event, WindowEvent};
+        use crate::platform_impl::wayland::WindowId;
+
+        let closed = WindowId::from(1);
+        let live = WindowId::from(2);
+        let mut sink = super::EventSink::new();
+        sink.push_window_event(WindowEvent::ImeResetCompleted { request_id: 7 }, closed);
+        sink.push_window_event(WindowEvent::ImeResetCompleted { request_id: 8 }, live);
+        assert_eq!(sink.drain_deliverable_for(|window| window == closed), vec![(
+            Event::WindowEvent {
+                window_id: crate::window::WindowId(live),
+                event: WindowEvent::ImeResetCompleted { request_id: 8 },
+            },
+            None,
+        )]);
     }
 }

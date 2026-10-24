@@ -538,6 +538,11 @@ impl Window {
     }
 
     #[inline]
+    pub fn reset_ime_with_request(&self, request_id: u64) {
+        x11_or_wayland!(match self; Window(w) => w.reset_ime_with_request(request_id))
+    }
+
+    #[inline]
     pub fn focus_window(&self) {
         x11_or_wayland!(match self; Window(w) => w.focus_window())
     }

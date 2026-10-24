@@ -109,6 +109,7 @@ fn x11_ime_spot_waits_for_the_input_method() {
 #[allow(dead_code)]
 fn reset_ime_is_public(window: &winit::window::Window) {
     window.reset_ime();
+    window.reset_ime_with_request(u64::MAX);
 }
 
 #[test]
@@ -123,9 +124,14 @@ fn linux_reset_ime_discards_the_composition() {
         .split_once("self.process_xevent(xev, &mut callback);")
         .expect("process_event doesn't process the event");
     assert!(
-        before.contains("self.handle_ime_requests(&mut callback);")
-            && after.contains("self.handle_ime_requests(&mut callback);"),
+        before.contains("self.handle_ime_requests();")
+            && after.contains("self.handle_ime_requests();"),
         "IME requests aren't handled before and after each event"
+    );
+    assert!(
+        before.contains("self.drain_ime_events(&mut callback);")
+            && after.contains("self.drain_ime_events(&mut callback);"),
+        "a queued reset fence can be overtaken by the next native event"
     );
     let context = source("linux/x11/ime/context.rs");
     assert!(context.contains("(xconn.xlib.XmbResetIC)(self.ic)"), "X11 doesn't reset the context");
@@ -250,7 +256,8 @@ fn wayland_ime_lifecycle_fences_late_incoming_events() {
     );
     assert!(
         sink.contains("committed_input: bool") && sink.contains("fn push_ime_commit("),
-        "delivery doesn't distinguish accepted commit transactions from retractable composition state"
+        "delivery doesn't distinguish accepted commit transactions from retractable composition \
+         state"
     );
     let enter = section(&text_input, "TextInputEvent::Enter", "TextInputEvent::Leave");
     assert!(
@@ -694,16 +701,19 @@ fn wayland_window_level_composition_and_delivery_seams_are_guarded() {
     );
 
     let event_loop = source("linux/wayland/event_loop/mod.rs");
-    let deliverable = section(
-        &event_loop,
-        "for (event, delete) in deliverable {",
-        "callback(event, &self.window_target);",
+    let dispatch = section(&event_loop, "fn dispatch_ime_events<", "\n}\n");
+    let production = section(&event_loop, "dispatch_ime_events(", "// Collect the window ids");
+    assert!(
+        dispatch.contains("sink::ime_event_window(&event)")
+            && dispatch.contains("ime_window.is_some_and")
+            && dispatch.contains("continue;")
+            && production.contains("requests.is_closed()"),
+        "the tombstone is checked only while draining, not immediately before each callback"
     );
     assert!(
-        deliverable.contains("ime_window.is_some_and")
-            && deliverable.contains("requests.is_closed()")
-            && deliverable.contains("continue;"),
-        "the tombstone is checked only while draining, not immediately before each callback"
+        sink.contains("pub(crate) fn ime_event_window<")
+            && sink.contains("WindowEvent::Ime(_) | WindowEvent::ImeResetCompleted { .. }"),
+        "completion and native input use different closed-window classifications"
     );
 
     let purpose = section(&state, "pub(crate) fn set_ime_purpose(", "\n    }\n");
@@ -720,7 +730,10 @@ fn wayland_window_level_composition_and_delivery_seams_are_guarded() {
         "a background-thread IME protocol request can remain unflushed"
     );
     assert!(
-        !text_input.contains("push_ime_event_at(\n                        sequence,\n                        Ime::Enabled"),
+        !text_input.contains(
+            "push_ime_event_at(\n                        sequence,\n                        \
+             Ime::Enabled"
+        ),
         "Enabled is still tagged as retractable composition"
     );
 }

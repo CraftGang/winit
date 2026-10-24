@@ -362,6 +362,9 @@ impl Window {
     pub fn reset_ime(&self) {}
 
     #[inline]
+    pub fn reset_ime_with_request(&self, _request_id: u64) {}
+
+    #[inline]
     pub fn focus_window(&self) {}
 
     #[inline]

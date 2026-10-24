@@ -10,9 +10,9 @@
 //! * Outgoing state (`set_content_type`, `set_cursor_rectangle`, `set_surrounding_text`) is a
 //!   desired snapshot per window and an acknowledged/pending snapshot per seat. A setter while a
 //!   commit is unacknowledged only marks the seat's desired state dirty; it is coalesced. The
-//!   matching `done` acknowledges the pending snapshot and flushes the newest desired snapshot
-//!   with exactly one fresh `commit`. The serial is the wrapping count of all commits issued on
-//!   the object, including the mandatory lifecycle commits.
+//!   matching `done` acknowledges the pending snapshot and flushes the newest desired snapshot with
+//!   exactly one fresh `commit`. The serial is the wrapping count of all commits issued on the
+//!   object, including the mandatory lifecycle commits.
 //!
 //! text-input-v3 says a `done` whose serial differs from the number of commits issued must still
 //! be applied normally, but the client must not change the protocol's current state; pending
@@ -502,6 +502,48 @@ fn reset_generation<T: TextInputRequests>(
     let (preedit_shown, sequence) = disable_generation(input, data);
     let (serial, _) = enable_generation(input, data, state);
     (preedit_shown, serial, sequence)
+}
+
+/// Reset a window's entered seats as one input fence. The caller holds the window lock.
+/// Hold every data lock until the completion ticket is reserved: otherwise the first seat's
+/// new generation could accept input while a later seat still belongs to the old context.
+fn reset_inputs_with_fence<T: TextInputRequests>(
+    inputs: &[(&T, Option<&std::sync::Mutex<TextInputDataInner>>)],
+    state: &OutgoingImeState,
+) -> (Vec<(bool, u64)>, u64) {
+    let mut locked: Vec<_> =
+        inputs.iter().map(|(_, data)| data.map(|data| data.lock().unwrap())).collect();
+    let mut resets = Vec::with_capacity(inputs.len());
+    for ((input, _), data) in inputs.iter().zip(&mut locked) {
+        let reset = if let Some(data) = data {
+            let (shown, _, sequence) = reset_generation(*input, data, state);
+            (shown, sequence)
+        } else {
+            let sequence = next_sequence();
+            input.disable();
+            input.commit();
+            input.enable();
+            send_state_requests(*input, state, ImeTextChangeCause::Other);
+            input.commit();
+            (false, sequence)
+        };
+        resets.push(reset);
+    }
+    // Also reserve a real fence when there are no entered objects. Old accepted input keeps
+    // its earlier tickets and a future enter cannot publish new input before this ticket.
+    let completion = next_sequence();
+    (resets, completion)
+}
+
+pub(crate) fn reset_ime_with_fence(
+    text_inputs: &[ZwpTextInputV3],
+    state: &OutgoingImeState,
+) -> (Vec<(bool, u64)>, u64) {
+    let inputs: Vec<_> = text_inputs
+        .iter()
+        .map(|input| (input, input.data::<TextInputData>().map(|data| &data.inner)))
+        .collect();
+    reset_inputs_with_fence(&inputs, state)
 }
 
 /// Whether clearing an IME context needs the only request that can make surrounding text
@@ -1195,9 +1237,9 @@ mod tests {
 
     use super::{
         context_reset_needed, disable_generation, enable_generation, next_sequence,
-        push_ime_teardown, reset_generation, serial_at_least, surrounding_text_excerpt,
-        OutgoingCommit, OutgoingImeState, SentContext, TextInputDataInner, TextInputRequests,
-        MAX_SURROUNDING_TEXT_BYTES as MAX,
+        push_ime_teardown, reset_generation, reset_inputs_with_fence, serial_at_least,
+        surrounding_text_excerpt, OutgoingCommit, OutgoingImeState, SentContext,
+        TextInputDataInner, TextInputRequests, MAX_SURROUNDING_TEXT_BYTES as MAX,
     };
     use crate::event::{Event, Ime, WindowEvent};
     use crate::platform::wayland::{ImeDeleteSurrounding, ImeTextChangeCause};
@@ -1323,14 +1365,11 @@ mod tests {
         data.finish_done(done_serial(&data), Some(window), &mut sink);
 
         // The deletion travels on the commit event itself.
-        assert_eq!(
-            deliveries(&mut sink),
-            vec![
-                (window, Ime::Preedit(String::new(), None), None),
-                (window, Ime::Commit("界".to_owned()), Some(delete)),
-                (window, Ime::Preedit("next".to_owned(), Some((1, 4))), None),
-            ]
-        );
+        assert_eq!(deliveries(&mut sink), vec![
+            (window, Ime::Preedit(String::new(), None), None),
+            (window, Ime::Commit("界".to_owned()), Some(delete)),
+            (window, Ime::Preedit("next".to_owned(), Some((1, 4))), None),
+        ]);
     }
 
     #[test]
@@ -1343,13 +1382,10 @@ mod tests {
 
         data.finish_done(done_serial(&data), Some(window), &mut sink);
 
-        assert_eq!(
-            deliveries(&mut sink),
-            vec![
-                (window, Ime::Preedit(String::new(), None), None),
-                (window, Ime::Commit(String::new()), Some(delete)),
-            ]
-        );
+        assert_eq!(deliveries(&mut sink), vec![
+            (window, Ime::Preedit(String::new(), None), None),
+            (window, Ime::Commit(String::new()), Some(delete)),
+        ]);
     }
 
     #[test]
@@ -1361,10 +1397,11 @@ mod tests {
 
         data.finish_done(done_serial(&data), Some(window), &mut sink);
 
-        assert_eq!(
-            deliveries(&mut sink),
-            vec![(window, Ime::Preedit("a".to_owned(), Some((1, 1))), None)]
-        );
+        assert_eq!(deliveries(&mut sink), vec![(
+            window,
+            Ime::Preedit("a".to_owned(), Some((1, 1))),
+            None
+        )]);
         assert!(data.preedit_shown);
     }
 
@@ -1401,26 +1438,20 @@ mod tests {
         data.preedit_string(Some("first".to_owned()), 1, 2);
         data.commit_string(Some("x".to_owned()));
         data.finish_done(done_serial(&data), Some(window), &mut sink);
-        assert_eq!(
-            deliveries(&mut sink),
-            vec![
-                (window, Ime::Preedit(String::new(), None), None),
-                (window, Ime::Commit("x".to_owned()), None),
-                (window, Ime::Preedit("first".to_owned(), Some((1, 2))), None),
-            ]
-        );
+        assert_eq!(deliveries(&mut sink), vec![
+            (window, Ime::Preedit(String::new(), None), None),
+            (window, Ime::Commit("x".to_owned()), None),
+            (window, Ime::Preedit("first".to_owned(), Some((1, 2))), None),
+        ]);
 
         data.commit_string(Some("y".to_owned()));
         data.preedit_string(Some("second".to_owned()), 0, 1);
         data.finish_done(done_serial(&data), Some(window), &mut sink);
-        assert_eq!(
-            deliveries(&mut sink),
-            vec![
-                (window, Ime::Preedit(String::new(), None), None),
-                (window, Ime::Commit("y".to_owned()), None),
-                (window, Ime::Preedit("second".to_owned(), Some((0, 1))), None),
-            ]
-        );
+        assert_eq!(deliveries(&mut sink), vec![
+            (window, Ime::Preedit(String::new(), None), None),
+            (window, Ime::Commit("y".to_owned()), None),
+            (window, Ime::Preedit("second".to_owned(), Some((0, 1))), None),
+        ]);
 
         data.commit_string(None);
         data.preedit_string(Some("third".to_owned()), 0, 0);
@@ -1450,15 +1481,12 @@ mod tests {
         data.commit_string(Some("second".to_owned()));
         data.finish_done(older_but_current, Some(window), &mut sink);
 
-        assert_eq!(
-            ime_events(&mut sink),
-            vec![
-                (window, Ime::Preedit(String::new(), None)),
-                (window, Ime::Commit("first".to_owned())),
-                (window, Ime::Preedit(String::new(), None)),
-                (window, Ime::Commit("second".to_owned())),
-            ]
-        );
+        assert_eq!(ime_events(&mut sink), vec![
+            (window, Ime::Preedit(String::new(), None)),
+            (window, Ime::Commit("first".to_owned())),
+            (window, Ime::Preedit(String::new(), None)),
+            (window, Ime::Commit("second".to_owned())),
+        ]);
     }
 
     #[test]
@@ -1495,13 +1523,10 @@ mod tests {
         data.commit_string(Some("new".to_owned()));
         data.finish_done(done_serial(&data), Some(window), &mut sink);
 
-        assert_eq!(
-            ime_events(&mut sink),
-            vec![
-                (window, Ime::Preedit(String::new(), None)),
-                (window, Ime::Commit("new".to_owned())),
-            ]
-        );
+        assert_eq!(ime_events(&mut sink), vec![
+            (window, Ime::Preedit(String::new(), None)),
+            (window, Ime::Commit("new".to_owned())),
+        ]);
     }
 
     #[test]
@@ -1547,15 +1572,12 @@ mod tests {
         data.commit_string(Some("new".to_owned()));
         data.finish_done(done_serial(&data), Some(window), &mut sink);
 
-        assert_eq!(
-            ime_events(&mut sink),
-            vec![
-                (window, Ime::Preedit(String::new(), None)),
-                (window, Ime::Commit("old".to_owned())),
-                (window, Ime::Preedit(String::new(), None)),
-                (window, Ime::Commit("new".to_owned())),
-            ]
-        );
+        assert_eq!(ime_events(&mut sink), vec![
+            (window, Ime::Preedit(String::new(), None)),
+            (window, Ime::Commit("old".to_owned())),
+            (window, Ime::Preedit(String::new(), None)),
+            (window, Ime::Commit("new".to_owned())),
+        ]);
     }
 
     #[test]
@@ -1567,10 +1589,10 @@ mod tests {
 
         data.preedit_string(Some("compose".to_owned()), 0, 7);
         data.finish_done(old_floor, Some(window), &mut sink);
-        assert_eq!(
-            ime_events(&mut sink),
-            vec![(window, Ime::Preedit("compose".to_owned(), Some((0, 7))))]
-        );
+        assert_eq!(ime_events(&mut sink), vec![(
+            window,
+            Ime::Preedit("compose".to_owned(), Some((0, 7)))
+        )]);
 
         // This is `reset_ime`: disable, commit, enable, commit.
         data.commit_string(Some("old generation".to_owned()));
@@ -1589,13 +1611,10 @@ mod tests {
         let later_commit = data.request_commit();
         data.commit_string(Some("new generation".to_owned()));
         data.finish_done(done_serial(&data), Some(window), &mut sink);
-        assert_eq!(
-            ime_events(&mut sink),
-            vec![
-                (window, Ime::Preedit(String::new(), None)),
-                (window, Ime::Commit("new generation".to_owned())),
-            ]
-        );
+        assert_eq!(ime_events(&mut sink), vec![
+            (window, Ime::Preedit(String::new(), None)),
+            (window, Ime::Commit("new generation".to_owned())),
+        ]);
         assert_ne!(done_serial(&data), later_commit);
     }
 
@@ -1614,13 +1633,10 @@ mod tests {
         data.start_incoming_generation(floor);
         data.commit_string(Some("wrapped".to_owned()));
         data.finish_done(0, Some(window), &mut sink);
-        assert_eq!(
-            ime_events(&mut sink),
-            vec![
-                (window, Ime::Preedit(String::new(), None)),
-                (window, Ime::Commit("wrapped".to_owned())),
-            ]
-        );
+        assert_eq!(ime_events(&mut sink), vec![
+            (window, Ime::Preedit(String::new(), None)),
+            (window, Ime::Commit("wrapped".to_owned())),
+        ]);
 
         data.commit_string(Some("before the fence".to_owned()));
         data.finish_done(u32::MAX - 3, Some(window), &mut sink);
@@ -1744,13 +1760,10 @@ mod tests {
             .into_iter()
             .filter(|(_, event, _)| matches!(event, Ime::Commit(_)))
             .collect();
-        assert_eq!(
-            commits,
-            vec![
-                (first, Ime::Commit("a".to_owned()), Some(first_delete)),
-                (second, Ime::Commit("b".to_owned()), Some(second_delete)),
-            ]
-        );
+        assert_eq!(commits, vec![
+            (first, Ime::Commit("a".to_owned()), Some(first_delete)),
+            (second, Ime::Commit("b".to_owned()), Some(second_delete)),
+        ]);
     }
 
     #[test]
@@ -1771,15 +1784,12 @@ mod tests {
         // `set_ime_allowed(false)` for the first window.
         first_input.end_incoming_generation();
 
-        assert_eq!(
-            ime_events(&mut sink),
-            vec![
-                (first, Ime::Preedit(String::new(), None)),
-                (first, Ime::Commit("first".to_owned())),
-                (second, Ime::Preedit(String::new(), None)),
-                (second, Ime::Commit("second".to_owned())),
-            ]
-        );
+        assert_eq!(ime_events(&mut sink), vec![
+            (first, Ime::Preedit(String::new(), None)),
+            (first, Ime::Commit("first".to_owned())),
+            (second, Ime::Preedit(String::new(), None)),
+            (second, Ime::Commit("second".to_owned())),
+        ]);
     }
 
     #[test]
@@ -2273,6 +2283,7 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         requests: RefCell<Vec<String>>,
+        on_commit: Option<Box<dyn Fn()>>,
     }
 
     impl Recorder {
@@ -2312,6 +2323,9 @@ mod tests {
 
         fn commit(&self) {
             self.push("commit");
+            if let Some(probe) = &self.on_commit {
+                probe();
+            }
         }
     }
 
@@ -2338,17 +2352,14 @@ mod tests {
 
         let (serial, _) = enable_generation(&recorder, &mut data, &state);
 
-        assert_eq!(
-            recorder.take(),
-            vec![
-                "enable",
-                "content_type:Normal",
-                "cursor:1,2,3,4",
-                "text_change_cause:Other",
-                "surrounding:abc:1:1",
-                "commit",
-            ]
-        );
+        assert_eq!(recorder.take(), vec![
+            "enable",
+            "content_type:Normal",
+            "cursor:1,2,3,4",
+            "text_change_cause:Other",
+            "surrounding:abc:1:1",
+            "commit",
+        ]);
         assert_eq!(data.incoming_from, Some(serial));
         assert!(data.accepts_incoming());
         assert_eq!(data.awaiting, Some(SentContext::Enabled(state)));
@@ -2364,19 +2375,16 @@ mod tests {
         let (was_shown, serial, _) = reset_generation(&recorder, &mut data, &state);
 
         assert!(!was_shown);
-        assert_eq!(
-            recorder.take(),
-            vec![
-                "disable",
-                "commit",
-                "enable",
-                "content_type:Normal",
-                "cursor:4,3,2,1",
-                "text_change_cause:Other",
-                "surrounding:next:2:2",
-                "commit",
-            ]
-        );
+        assert_eq!(recorder.take(), vec![
+            "disable",
+            "commit",
+            "enable",
+            "content_type:Normal",
+            "cursor:4,3,2,1",
+            "text_change_cause:Other",
+            "surrounding:next:2:2",
+            "commit",
+        ]);
         assert_eq!(data.incoming_from, Some(serial));
         assert!(data.accepts_incoming());
     }
@@ -2486,15 +2494,12 @@ mod tests {
             data.sync_outgoing(&recorder, &changed, Some(ImeTextChangeCause::InputMethod)),
             OutgoingCommit::Sent(_)
         ));
-        assert_eq!(
-            recorder.take(),
-            vec![
-                "content_type:Normal",
-                "text_change_cause:InputMethod",
-                "surrounding:after commit:12:12",
-                "commit",
-            ]
-        );
+        assert_eq!(recorder.take(), vec![
+            "content_type:Normal",
+            "text_change_cause:InputMethod",
+            "surrounding:after commit:12:12",
+            "commit",
+        ]);
     }
 
     #[test]
@@ -2667,15 +2672,12 @@ mod tests {
             data.acknowledge_done(enable_serial, Some(&changed), &recorder),
             OutgoingCommit::Sent(enable_serial.wrapping_add(1))
         );
-        assert_eq!(
-            recorder.take(),
-            vec![
-                "content_type:Normal",
-                "text_change_cause:Other",
-                "surrounding:abcd:4:4",
-                "commit",
-            ]
-        );
+        assert_eq!(recorder.take(), vec![
+            "content_type:Normal",
+            "text_change_cause:Other",
+            "surrounding:abcd:4:4",
+            "commit",
+        ]);
     }
 
     #[test]
@@ -2750,15 +2752,12 @@ mod tests {
             OutgoingCommit::Unmatched
         );
         assert_eq!(data.acknowledge_done(0, Some(&changed), &recorder), OutgoingCommit::Sent(1));
-        assert_eq!(
-            recorder.take(),
-            vec![
-                "content_type:Normal",
-                "text_change_cause:Other",
-                "surrounding:wrapped:7:7",
-                "commit",
-            ]
-        );
+        assert_eq!(recorder.take(), vec![
+            "content_type:Normal",
+            "text_change_cause:Other",
+            "surrounding:wrapped:7:7",
+            "commit",
+        ]);
     }
 
     #[test]
@@ -3032,20 +3031,24 @@ mod tests {
             first.acknowledge_done(first_serial, Some(&changed), &first_recorder),
             OutgoingCommit::Sent(first_serial.wrapping_add(1))
         );
-        assert_eq!(
-            first_recorder.take(),
-            vec!["content_type:Normal", "text_change_cause:Other", "surrounding:new:3:3", "commit",]
-        );
+        assert_eq!(first_recorder.take(), vec![
+            "content_type:Normal",
+            "text_change_cause:Other",
+            "surrounding:new:3:3",
+            "commit",
+        ]);
         assert!(second_recorder.take().is_empty(), "one seat's done flushed another seat");
 
         assert_eq!(
             second.acknowledge_done(second_serial, Some(&changed), &second_recorder),
             OutgoingCommit::Sent(second_serial.wrapping_add(1))
         );
-        assert_eq!(
-            second_recorder.take(),
-            vec!["content_type:Normal", "text_change_cause:Other", "surrounding:new:3:3", "commit",]
-        );
+        assert_eq!(second_recorder.take(), vec![
+            "content_type:Normal",
+            "text_change_cause:Other",
+            "surrounding:new:3:3",
+            "commit",
+        ]);
 
         // The next commit is still outstanding. A stale done must not acknowledge it.
         assert_eq!(
@@ -3091,5 +3094,112 @@ mod tests {
             ],
             "a new generation's preedit overtook its synthetic Enabled event"
         );
+    }
+
+    #[test]
+    fn requested_reset_orders_old_commit_fence_and_new_suffix_without_visible_preedit() {
+        for visible in [false, true] {
+            let window = owner(1);
+            let data = std::sync::Mutex::new(enabled(window));
+            let recorder = Recorder::default();
+            let mut protocol_events = EventSink::new();
+            let mut window_events = EventSink::new();
+            {
+                let mut data = data.lock().unwrap();
+                data.commit_string(Some("old commit".into()));
+                let serial = done_serial(&data);
+                data.finish_done(serial, Some(window), &mut protocol_events);
+                if visible {
+                    data.preedit_string(Some("old preview".into()), 0, 11);
+                    data.finish_done(serial, Some(window), &mut protocol_events);
+                }
+            }
+            let (resets, fence) =
+                reset_inputs_with_fence(&[(&recorder, Some(&data))], &state(None, None));
+            assert_eq!(resets[0].0, visible);
+            {
+                let mut data = data.lock().unwrap();
+                let serial = done_serial(&data);
+                data.preedit_string(Some("new preview".into()), 0, 11);
+                data.finish_done(serial, Some(window), &mut protocol_events);
+                data.commit_string(Some("new commit".into()));
+                data.finish_done(serial, Some(window), &mut protocol_events);
+            }
+            // The new suffix arrived at its sink before the window pushed its fence. The
+            // reserved sequence must still place the completion before that suffix.
+            if visible {
+                window_events.push_window_event_at(
+                    resets[0].1,
+                    WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+                    window,
+                );
+            }
+            window_events.push_window_event_at(
+                fence,
+                WindowEvent::ImeResetCompleted { request_id: u64::MAX },
+                window,
+            );
+            protocol_events.append_ordered(&mut window_events);
+            let actual: Vec<_> =
+                protocol_events.drain_deliverable().into_iter().map(|(e, _)| e).collect();
+            let mut expected = vec![
+                WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+                WindowEvent::Ime(Ime::Commit("old commit".into())),
+            ];
+            if visible {
+                expected.push(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+            }
+            expected.extend([
+                WindowEvent::ImeResetCompleted { request_id: u64::MAX },
+                WindowEvent::Ime(Ime::Preedit("new preview".into(), Some((0, 11)))),
+                WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+                WindowEvent::Ime(Ime::Commit("new commit".into())),
+            ]);
+            assert_eq!(
+                actual,
+                expected
+                    .into_iter()
+                    .map(|event| Event::WindowEvent {
+                        window_id: crate::window::WindowId(window),
+                        event,
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn requested_reset_holds_all_entered_seats_until_the_fence_is_reserved() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::sync::{Mutex, TryLockError};
+
+        let first = Rc::new(Mutex::new(enabled(owner(1))));
+        let second = Rc::new(Mutex::new(enabled(owner(1))));
+        let probes = Rc::new(Cell::new(0));
+        let make_recorder = || {
+            let first = Rc::clone(&first);
+            let second = Rc::clone(&second);
+            let probes = Rc::clone(&probes);
+            Recorder {
+                on_commit: Some(Box::new(move || {
+                    assert!(matches!(first.try_lock(), Err(TryLockError::WouldBlock)));
+                    assert!(matches!(second.try_lock(), Err(TryLockError::WouldBlock)));
+                    probes.set(probes.get() + 1);
+                })),
+                ..Recorder::default()
+            }
+        };
+        let first_recorder = make_recorder();
+        let second_recorder = make_recorder();
+        let (resets, fence) = reset_inputs_with_fence(
+            &[(&first_recorder, Some(&first)), (&second_recorder, Some(&second))],
+            &state(None, None),
+        );
+        assert_eq!(probes.get(), 4);
+        assert!(resets.iter().all(|(_, sequence)| *sequence < fence));
+        assert!(first.try_lock().is_ok() && second.try_lock().is_ok());
+        let (_, empty_fence) = reset_inputs_with_fence::<Recorder>(&[], &state(None, None));
+        assert!(fence < empty_fence);
     }
 }

@@ -716,6 +716,33 @@ impl Window {
     }
 
     #[inline]
+    pub fn reset_ime_with_request(&self, request_id: u64) {
+        let update = publish_requested_ime_reset(
+            &self.window_state,
+            |window_state| window_state.ime_allowed().then(|| window_state.reset_ime_with_fence()),
+            |update, completion| {
+                let mut sink = self.window_events_sink.lock().unwrap();
+                if let Some(sequence) = update.boundary {
+                    sink.push_window_event_at(
+                        sequence,
+                        WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+                        self.window_id,
+                    );
+                }
+                sink.push_window_event_at(
+                    completion,
+                    WindowEvent::ImeResetCompleted { request_id },
+                    self.window_id,
+                );
+            },
+        );
+        if let Some(update) = update {
+            // Even without entered input, the locally queued fence must be delivered.
+            self.wake_for_ime_state(state::ImeStateUpdate { sent: true, ..update });
+        }
+    }
+
+    #[inline]
     pub fn focus_window(&self) {}
 
     #[inline]
@@ -857,5 +884,168 @@ impl TryFrom<&str> for Theme {
         } else {
             Err(())
         }
+    }
+}
+
+/// Run the requested native transition and publish its reserved events.
+fn publish_requested_ime_reset<S>(
+    window_state: &Mutex<S>,
+    transition: impl FnOnce(&mut S) -> Option<(state::ImeStateUpdate, u64)>,
+    publish: impl FnOnce(state::ImeStateUpdate, u64),
+) -> Option<state::ImeStateUpdate> {
+    let mut window_state = window_state.lock().unwrap();
+    let (update, completion) = transition(&mut window_state)?;
+    // Keep admission closed until the reserved events exist in the shared sink. Sequence
+    // sorting cannot repair a suffix that an event loop already drained before publication.
+    // The production publisher only takes the sink lock; it never calls application code.
+    publish(update, completion);
+    drop(window_state);
+    Some(update)
+}
+
+#[cfg(test)]
+mod requested_ime_publication_tests {
+    use std::sync::{mpsc, Arc, Barrier, Mutex, TryLockError};
+
+    use super::state::ImeStateUpdate;
+    use super::{publish_requested_ime_reset, EventSink, WindowId};
+    use crate::event::{Event, Ime, WindowEvent};
+    use crate::platform_impl::wayland::event_loop::sink::next_sequence;
+
+    #[test]
+    fn requested_reset_blocks_suffix_admission_until_the_fence_is_published() {
+        let state = Arc::new(Mutex::new(()));
+        let synthetic = Arc::new(Mutex::new(EventSink::new()));
+        let release = Arc::new(Barrier::new(2));
+        let (publishing, ready) = mpsc::channel();
+        let window = WindowId::from(1);
+        let worker = {
+            let state = Arc::clone(&state);
+            let synthetic = Arc::clone(&synthetic);
+            let release = Arc::clone(&release);
+            std::thread::spawn(move || {
+                publish_requested_ime_reset(
+                    &state,
+                    |_| Some((ImeStateUpdate::default(), next_sequence())),
+                    |_, sequence| {
+                        // Pause in the production publication callback after ticket reservation.
+                        publishing.send(()).unwrap();
+                        release.wait();
+                        synthetic.lock().unwrap().push_window_event_at(
+                            sequence,
+                            WindowEvent::ImeResetCompleted { request_id: 7 },
+                            window,
+                        );
+                    },
+                );
+            })
+        };
+        ready.recv().unwrap();
+        let mut delivered = Vec::new();
+        let admitted_early = match state.try_lock() {
+            Ok(_admission) => {
+                let mut protocol = EventSink::new();
+                protocol.push_window_event(
+                    WindowEvent::Ime(Ime::Preedit("new".into(), Some((3, 3)))),
+                    window,
+                );
+                protocol.append_ordered(&mut synthetic.lock().unwrap());
+                // This is a completed drain, not a sort performed after both sinks were filled.
+                delivered.extend(protocol.drain_deliverable());
+                true
+            },
+            Err(TryLockError::WouldBlock) => false,
+            Err(error) => panic!("window state failed: {error}"),
+        };
+        release.wait();
+        worker.join().unwrap();
+        let mut protocol = EventSink::new();
+        if !admitted_early {
+            let _admission = state.lock().unwrap();
+            protocol.push_window_event(
+                WindowEvent::Ime(Ime::Preedit("new".into(), Some((3, 3)))),
+                window,
+            );
+        }
+        protocol.append_ordered(&mut synthetic.lock().unwrap());
+        delivered.extend(protocol.drain_deliverable());
+        assert_eq!(delivered.into_iter().map(|(event, _)| event).collect::<Vec<_>>(), vec![
+            Event::WindowEvent {
+                window_id: crate::window::WindowId(window),
+                event: WindowEvent::ImeResetCompleted { request_id: 7 },
+            },
+            Event::WindowEvent {
+                window_id: crate::window::WindowId(window),
+                event: WindowEvent::Ime(Ime::Preedit("new".into(), Some((3, 3)))),
+            },
+        ]);
+    }
+
+    #[test]
+    fn concurrent_empty_resets_publish_in_transition_order() {
+        let state = Arc::new(Mutex::new(()));
+        let synthetic = Arc::new(Mutex::new(EventSink::new()));
+        let release = Arc::new(Barrier::new(2));
+        let (publishing, ready) = mpsc::channel();
+        let window = WindowId::from(1);
+        let first = {
+            let state = Arc::clone(&state);
+            let synthetic = Arc::clone(&synthetic);
+            let release = Arc::clone(&release);
+            std::thread::spawn(move || {
+                publish_requested_ime_reset(
+                    &state,
+                    |_| Some((ImeStateUpdate::default(), next_sequence())),
+                    |_, sequence| {
+                        publishing.send(()).unwrap();
+                        release.wait();
+                        synthetic.lock().unwrap().push_window_event_at(
+                            sequence,
+                            WindowEvent::ImeResetCompleted { request_id: 7 },
+                            window,
+                        );
+                    },
+                );
+            })
+        };
+        ready.recv().unwrap();
+        let admission_blocked = matches!(state.try_lock(), Err(TryLockError::WouldBlock));
+        let (starting, started) = mpsc::channel();
+        let second = {
+            let state = Arc::clone(&state);
+            let synthetic = Arc::clone(&synthetic);
+            std::thread::spawn(move || {
+                starting.send(()).unwrap();
+                publish_requested_ime_reset(
+                    &state,
+                    |_| Some((ImeStateUpdate::default(), next_sequence())),
+                    |_, sequence| {
+                        synthetic.lock().unwrap().push_window_event_at(
+                            sequence,
+                            WindowEvent::ImeResetCompleted { request_id: 8 },
+                            window,
+                        )
+                    },
+                );
+            })
+        };
+        started.recv().unwrap();
+        release.wait();
+        first.join().unwrap();
+        second.join().unwrap();
+        assert!(admission_blocked, "another reset could pass an unpublished empty reset");
+        let completions: Vec<_> = synthetic
+            .lock()
+            .unwrap()
+            .drain_deliverable()
+            .into_iter()
+            .filter_map(|(event, _)| match event {
+                Event::WindowEvent {
+                    event: WindowEvent::ImeResetCompleted { request_id }, ..
+                } => Some(request_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completions, vec![7, 8]);
     }
 }

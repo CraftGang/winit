@@ -1760,6 +1760,15 @@ impl UnownedWindow {
     }
 
     #[inline]
+    pub fn reset_ime_with_request(&self, request_id: u64) {
+        let _ = self
+            .ime_sender
+            .lock()
+            .unwrap()
+            .send(ImeRequest::ResetWithRequest(self.xwindow as ffi::Window, request_id));
+    }
+
+    #[inline]
     pub fn focus_window(&self) {
         let atoms = self.xconn.atoms();
         let state_atom = atoms[WM_STATE];

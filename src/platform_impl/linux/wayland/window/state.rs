@@ -41,9 +41,9 @@ use crate::window::{CursorGrabMode, CursorIcon, ImePurpose, ResizeDirection, The
 
 use crate::platform::wayland::{ImeDeleteSurrounding, ImeTextChangeCause};
 use crate::platform_impl::wayland::seat::{
-    context_reset_needed, surrounding_text_excerpt, OutgoingCommit, OutgoingImeState,
-    PointerConstraintsState, TextInputData, WinitPointerData, WinitPointerDataExt,
-    ZwpTextInputV3Ext,
+    context_reset_needed, reset_ime_with_fence, surrounding_text_excerpt, OutgoingCommit,
+    OutgoingImeState, PointerConstraintsState, TextInputData, WinitPointerData,
+    WinitPointerDataExt, ZwpTextInputV3Ext,
 };
 use crate::platform_impl::wayland::state::{WindowCompositorUpdate, WinitState};
 
@@ -1310,6 +1310,21 @@ impl WindowState {
             self.ime_preedit_owner.clear();
         }
         ImeStateUpdate { boundary: clear_boundary, sent }
+    }
+
+    pub(crate) fn reset_ime_with_fence(&mut self) -> (ImeStateUpdate, u64) {
+        let state = self.outgoing_ime_state();
+        let (resets, completion) = reset_ime_with_fence(&self.text_inputs, &state);
+        let mut clear_boundary = None;
+        for (text_input, (shown, sequence)) in self.text_inputs.iter().zip(resets) {
+            if self.ime_preedit_owner.owns(text_input) && shown {
+                clear_boundary = Some(sequence);
+            }
+        }
+        self.ime_preedit_owner.clear();
+        let update =
+            ImeStateUpdate { boundary: clear_boundary, sent: !self.text_inputs.is_empty() };
+        (update, completion)
     }
 
     /// Forgets the cached surrounding text and invalidates the protocol context when needed.

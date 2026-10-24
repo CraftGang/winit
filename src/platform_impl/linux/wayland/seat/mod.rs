@@ -30,11 +30,11 @@ mod touch;
 
 pub use pointer::relative_pointer::RelativePointerState;
 pub use pointer::{PointerConstraintsState, WinitPointerData, WinitPointerDataExt};
-pub(crate) use text_input::TextInputData;
 pub use text_input::{
     context_reset_needed, surrounding_text_excerpt, OutgoingCommit, OutgoingImeState,
     TextInputState, ZwpTextInputV3Ext,
 };
+pub(crate) use text_input::{reset_ime_with_fence, TextInputData};
 
 use keyboard::{KeyboardData, KeyboardState};
 use text_input::push_ime_teardown;

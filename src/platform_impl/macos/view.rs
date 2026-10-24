@@ -132,6 +132,9 @@ pub struct ViewState {
     ///
     /// Can be set using `set_ime_allowed`
     ime_allowed: Cell<bool>,
+    ime_reset_alive: Cell<bool>,
+    native_ime_callbacks: Cell<usize>,
+    pending_ime_resets: RefCell<VecDeque<u64>>,
 
     /// True if the current key event should be forwarded
     /// to the application, even during IME
@@ -308,6 +311,7 @@ declare_class!(
             replacement_range: NSRange,
         ) {
             trace_scope!("setMarkedText:selectedRange:replacementRange:");
+            let _ime_callback = self.begin_ime_callback();
             self.ivars().key_interpreted.set(true);
             self.ivars().ime_startup.borrow_mut().other_callback();
             // Press-and-hold marks the letter just typed while it shows the accent menu.
@@ -380,6 +384,7 @@ declare_class!(
         #[method(unmarkText)]
         fn unmark_text(&self) {
             trace_scope!("unmarkText");
+            let _ime_callback = self.begin_ime_callback();
             self.ivars().key_interpreted.set(true);
             self.ivars().ime_startup.borrow_mut().other_callback();
             *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
@@ -453,6 +458,7 @@ declare_class!(
         #[method(insertText:replacementRange:)]
         fn insert_text(&self, string: &NSObject, replacement_range: NSRange) {
             trace_scope!("insertText:replacementRange:");
+            let _ime_callback = self.begin_ime_callback();
             self.ivars().key_interpreted.set(true);
 
             // SAFETY: This method is guaranteed to get either a `NSString` or a `NSAttributedString`.
@@ -999,6 +1005,9 @@ impl WinitView {
             input_source: Default::default(),
             pending_commit: Default::default(),
             ime_allowed: Default::default(),
+            ime_reset_alive: Cell::new(true),
+            native_ime_callbacks: Cell::new(0),
+            pending_ime_resets: RefCell::new(VecDeque::new()),
             forward_key_to_app: Default::default(),
             in_key_down: Default::default(),
             committed_in_key_down: Default::default(),
@@ -1188,6 +1197,51 @@ impl WinitView {
         if self.ivars().ime_state.get() == ImeState::Preedit {
             self.ivars().ime_state.set(ImeState::Ground);
         }
+    }
+
+    pub(super) fn reset_ime_with_request(&self, request_id: u64) {
+        if !self.ivars().ime_allowed.get() || !self.ivars().ime_reset_alive.get() {
+            return;
+        }
+        self.reset_ime();
+        // insertText can be suspended in its first empty-preedit app callback with an old
+        // result already copied locally. Its remaining accepted payload must precede the fence.
+        if self.ivars().native_ime_callbacks.get() != 0 {
+            self.ivars().pending_ime_resets.borrow_mut().push_back(request_id);
+        } else {
+            self.queue_ime_reset_completion(request_id);
+        }
+    }
+
+    fn queue_ime_reset_completion(&self, request_id: u64) {
+        // Use the same FIFO as accepted commits (including their attached deletion) and any
+        // synchronous unmarkText callback from discardMarkedText. No marked range is required:
+        // an application can still be waiting for the terminal of an already cleared preedit.
+        let view = self.retain();
+        self.ivars().app_delegate.maybe_queue_handler(move |app_delegate| {
+            // A preceding callback can drop the window or disable its context after this
+            // completion was queued. Retaining the view alone does not keep the window live.
+            if !view.ivars().ime_allowed.get() || !view.ivars().ime_reset_alive.get() {
+                return;
+            }
+            if let Some(window) = view.ivars()._ns_window.load() {
+                app_delegate.handle_window_event(window.id(), WindowEvent::ImeResetCompleted {
+                    request_id,
+                });
+            }
+        });
+    }
+
+    pub(super) fn invalidate_ime_reset_requests(&self) {
+        self.ivars().ime_reset_alive.set(false);
+        self.ivars().pending_ime_resets.borrow_mut().clear();
+    }
+
+    fn begin_ime_callback(&self) -> NativeImeCallback {
+        let depth = &self.ivars().native_ime_callbacks;
+        depth.set(depth.get().checked_add(1).expect("native IME callback depth exhausted"));
+        // An application callback can close the window while this selector is suspended.
+        NativeImeCallback(self.retain())
     }
 
     pub(super) fn set_ime_cursor_area(&self, position: NSPoint, size: NSSize) {
@@ -1440,5 +1494,28 @@ fn replace_event(event: &NSEvent, option_as_alt: OptionAsAlt) -> Retained<NSEven
         }
     } else {
         event.copy()
+    }
+}
+
+/// Completion can only leave the outermost native producer after its copied input was queued.
+struct NativeImeCallback(Retained<WinitView>);
+
+impl Drop for NativeImeCallback {
+    fn drop(&mut self) {
+        let view = &self.0;
+        let depth = &view.ivars().native_ime_callbacks;
+        depth.set(depth.get().saturating_sub(1));
+        if depth.get() != 0 {
+            return;
+        }
+        // Release the RefCell before dispatching: a completion callback can request a new reset.
+        let pending = std::mem::take(&mut *view.ivars().pending_ime_resets.borrow_mut());
+        if std::thread::panicking() {
+            // No success acknowledgement while the native producer is unwinding.
+            return;
+        }
+        for request_id in pending {
+            view.queue_ime_reset_completion(request_id);
+        }
     }
 }

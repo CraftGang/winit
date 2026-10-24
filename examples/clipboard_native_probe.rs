@@ -1,21 +1,17 @@
 //! Opt-in native protocol probe; driven by a private compositor, never a user's clipboard.
 #[cfg(all(unix, not(target_os = "macos"), feature = "wayland"))]
 mod probe {
-    use std::{
-        sync::Arc,
-        time::{Duration, Instant},
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use winit::application::ApplicationHandler;
+    use winit::event::{ElementState, WindowEvent};
+    use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+    use winit::keyboard::Key;
+    use winit::platform::wayland::{
+        ActiveEventLoopExtWayland, EventLoopBuilderExtWayland, SelectionClaim, TransferHandle,
+        TransferOptions,
     };
-    use winit::{
-        application::ApplicationHandler,
-        event::{ElementState, WindowEvent},
-        event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
-        keyboard::Key,
-        platform::wayland::{
-            ActiveEventLoopExtWayland, EventLoopBuilderExtWayland, SelectionClaim, TransferHandle,
-            TransferOptions,
-        },
-        window::{Window, WindowId},
-    };
+    use winit::window::{Window, WindowId};
 
     #[derive(Debug)]
     pub struct Ready;
@@ -216,6 +212,7 @@ mod probe {
         event_loop.run_app(&mut app).expect("native probe event loop");
     }
 }
+#[cfg(all(unix, not(target_os = "macos"), feature = "wayland"))]
 #[path = "util/fill.rs"]
 mod fill;
 fn main() {

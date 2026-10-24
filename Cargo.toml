@@ -386,3 +386,8 @@ mint = "0.5.6"
 name = "macos_termination"
 path = "tests/macos_termination.rs"
 harness = false
+
+[[test]]
+name = "ime_reset_dispatch"
+path = "tests/ime_reset_dispatch.rs"
+harness = false

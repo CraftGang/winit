@@ -389,6 +389,9 @@ impl Inner {
 
     pub fn reset_ime(&self) {}
 
+    #[inline]
+    pub fn reset_ime_with_request(&self, _request_id: u64) {}
+
     pub fn focus_window(&self) {
         warn!("`Window::set_focus` is ignored on iOS")
     }

@@ -151,6 +151,7 @@ declare_class!(
         #[method(windowWillClose:)]
         fn window_will_close(&self, _: Option<&AnyObject>) {
             trace_scope!("windowWillClose:");
+            self.view().invalidate_ime_reset_requests();
             // `setDelegate:` retains the previous value and then autoreleases it
             autoreleasepool(|_| {
                 // Since El Capitan, we need to be careful that delegate methods can't
@@ -830,13 +831,10 @@ impl WindowDelegate {
 
         let suggested_size = content_size.to_physical(scale_factor);
         let new_inner_size = Arc::new(Mutex::new(suggested_size));
-        app_delegate.handle_window_event(
-            window.id(),
-            WindowEvent::ScaleFactorChanged {
-                scale_factor,
-                inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&new_inner_size)),
-            },
-        );
+        app_delegate.handle_window_event(window.id(), WindowEvent::ScaleFactorChanged {
+            scale_factor,
+            inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&new_inner_size)),
+        });
         let physical_size = *new_inner_size.lock().unwrap();
         drop(new_inner_size);
 
@@ -1576,6 +1574,11 @@ impl WindowDelegate {
     #[inline]
     pub fn reset_ime(&self) {
         self.view().reset_ime();
+    }
+
+    #[inline]
+    pub fn reset_ime_with_request(&self, request_id: u64) {
+        self.view().reset_ime_with_request(request_id);
     }
 
     #[inline]

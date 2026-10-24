@@ -597,9 +597,9 @@ impl fmt::Debug for TransferOptions {
 
 /// An opaque winit-issued input/seat/focus-generation token.
 ///
-/// Obtain one from [`crate::platform::wayland::Clipboard::input_origin`] while handling the input that triggers a copy.
-/// It is deliberately not constructible outside winit; cloning an old token does not make it
-/// fresh again.
+/// Obtain one from [`crate::platform::wayland::Clipboard::input_origin`] while handling the input
+/// that triggers a copy. It is deliberately not constructible outside winit; cloning an old token
+/// does not make it fresh again.
 ///
 /// A token is single-use per selection family: the same triggering input may claim the regular
 /// clipboard once and PRIMARY once, but a second claim in either family returns `InvalidInput`.
@@ -853,11 +853,12 @@ impl OriginTokenInner {
 
 /// A synchronous selection ownership claim.
 ///
-/// `trigger` must come from [`crate::platform::wayland::Clipboard::input_origin`] for the same input turn that asks for the
-/// copy. Claims validate that the trigger's seat is still the active input seat, that it focuses
-/// the target window in the same focus epoch, and that the triggering keyboard or pointer serial
-/// is still the latest one before replacing any owned source. Each family consumes its own copy
-/// of the trigger, so one input may set the regular and PRIMARY selections, once each.
+/// `trigger` must come from [`crate::platform::wayland::Clipboard::input_origin`] for the same
+/// input turn that asks for the copy. Claims validate that the trigger's seat is still the active
+/// input seat, that it focuses the target window in the same focus epoch, and that the triggering
+/// keyboard or pointer serial is still the latest one before replacing any owned source. Each
+/// family consumes its own copy of the trigger, so one input may set the regular and PRIMARY
+/// selections, once each.
 #[derive(Clone, Debug)]
 pub struct SelectionClaim {
     pub target_window: WindowId,
@@ -1639,13 +1640,10 @@ enum ProtocolSource {
 impl fmt::Debug for ProtocolSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProtocolSource")
-            .field(
-                "family",
-                &match self {
-                    Self::Regular(_) => "regular",
-                    Self::Primary(_) => "primary",
-                },
-            )
+            .field("family", &match self {
+                Self::Regular(_) => "regular",
+                Self::Primary(_) => "primary",
+            })
             .finish()
     }
 }
@@ -2729,13 +2727,10 @@ impl Inner {
                 _ => false,
             };
             if !fits {
-                return Err(io::Error::new(
-                    ErrorKind::Unsupported,
-                    match kind {
-                        SelectionKind::Regular => "no data device for the seat",
-                        SelectionKind::Primary => "no primary selection device for the seat",
-                    },
-                ));
+                return Err(io::Error::new(ErrorKind::Unsupported, match kind {
+                    SelectionKind::Regular => "no data device for the seat",
+                    SelectionKind::Primary => "no primary selection device for the seat",
+                }));
             }
         }
 
@@ -2849,13 +2844,10 @@ impl Inner {
                 _ => false,
             };
             if !fits {
-                return Err(io::Error::new(
-                    ErrorKind::Unsupported,
-                    match kind {
-                        SelectionKind::Regular => "no data device for the seat",
-                        SelectionKind::Primary => "no primary selection device for the seat",
-                    },
-                ));
+                return Err(io::Error::new(ErrorKind::Unsupported, match kind {
+                    SelectionKind::Regular => "no data device for the seat",
+                    SelectionKind::Primary => "no primary selection device for the seat",
+                }));
             }
         }
         self.mark_source_token(token);
@@ -7058,17 +7050,14 @@ mod tests {
             let reservation = workers.reserve_read().unwrap();
             assert_eq!(reservation, Reservation::Active);
             workers
-                .submit_reserved_read(
-                    reservation,
-                    ReadJob {
-                        slot: Arc::downgrade(&slot),
-                        fd: read,
-                        deadline: Instant::now() + Duration::from_secs(30),
-                        max_bytes: 16,
-                        kind: ReadKind::Text,
-                        image_permit: None,
-                    },
-                )
+                .submit_reserved_read(reservation, ReadJob {
+                    slot: Arc::downgrade(&slot),
+                    fd: read,
+                    deadline: Instant::now() + Duration::from_secs(30),
+                    max_bytes: 16,
+                    kind: ReadKind::Text,
+                    image_permit: None,
+                })
                 .unwrap();
             slots.push(slot);
             writers.push(write);
@@ -7084,16 +7073,13 @@ mod tests {
             let reservation = workers.reserve_write().unwrap();
             assert_eq!(reservation, Reservation::Active);
             workers
-                .submit_reserved_write(
-                    reservation,
-                    WriteJob {
-                        serving: Arc::downgrade(serving),
-                        fd: write,
-                        payload: OwnedPayload::Text(text.clone()),
-                        _source_bytes: test_source_charge(0),
-                        deadline: Instant::now() + Duration::from_secs(30),
-                    },
-                )
+                .submit_reserved_write(reservation, WriteJob {
+                    serving: Arc::downgrade(serving),
+                    fd: write,
+                    payload: OwnedPayload::Text(text.clone()),
+                    _source_bytes: test_source_charge(0),
+                    deadline: Instant::now() + Duration::from_secs(30),
+                })
                 .unwrap();
             readers.push(read);
         }
@@ -7139,17 +7125,14 @@ mod tests {
         let error = workers
             .reserve_read()
             .and_then(|reservation| {
-                workers.submit_reserved_read(
-                    reservation,
-                    ReadJob {
-                        slot: Arc::downgrade(&slot),
-                        fd: read,
-                        deadline: Instant::now() + Duration::from_secs(30),
-                        max_bytes: 16,
-                        kind: ReadKind::Text,
-                        image_permit: None,
-                    },
-                )
+                workers.submit_reserved_read(reservation, ReadJob {
+                    slot: Arc::downgrade(&slot),
+                    fd: read,
+                    deadline: Instant::now() + Duration::from_secs(30),
+                    max_bytes: 16,
+                    kind: ReadKind::Text,
+                    image_permit: None,
+                })
             })
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::WouldBlock);
@@ -7217,17 +7200,14 @@ mod tests {
             let reservation = workers.reserve_read().unwrap();
             assert_eq!(reservation, Reservation::Queued);
             workers
-                .submit_reserved_read(
-                    reservation,
-                    ReadJob {
-                        slot: Arc::downgrade(&slot),
-                        fd: read,
-                        deadline: Instant::now() + Duration::from_secs(30),
-                        max_bytes: 16,
-                        kind: ReadKind::Text,
-                        image_permit: None,
-                    },
-                )
+                .submit_reserved_read(reservation, ReadJob {
+                    slot: Arc::downgrade(&slot),
+                    fd: read,
+                    deadline: Instant::now() + Duration::from_secs(30),
+                    max_bytes: 16,
+                    kind: ReadKind::Text,
+                    image_permit: None,
+                })
                 .unwrap();
             slots.push(slot);
             writers.push(write);
@@ -7291,16 +7271,13 @@ mod tests {
             let reservation = workers.reserve_write().unwrap();
             assert_eq!(reservation, Reservation::Queued);
             workers
-                .submit_reserved_write(
-                    reservation,
-                    WriteJob {
-                        serving: Arc::downgrade(&serving),
-                        fd: write,
-                        payload: OwnedPayload::Text(Arc::from("queued")),
-                        _source_bytes: test_source_charge(0),
-                        deadline: Instant::now() + Duration::from_secs(30),
-                    },
-                )
+                .submit_reserved_write(reservation, WriteJob {
+                    serving: Arc::downgrade(&serving),
+                    fd: write,
+                    payload: OwnedPayload::Text(Arc::from("queued")),
+                    _source_bytes: test_source_charge(0),
+                    deadline: Instant::now() + Duration::from_secs(30),
+                })
                 .unwrap();
             readers.push(read);
         }
@@ -7368,17 +7345,14 @@ mod tests {
         let reservation = workers.reserve_read().unwrap();
         assert_eq!(reservation, Reservation::Queued);
         workers
-            .submit_reserved_read(
-                reservation,
-                ReadJob {
-                    slot: Arc::downgrade(&slot),
-                    fd: read,
-                    deadline: Instant::now() + Duration::from_millis(5),
-                    max_bytes: 16,
-                    kind: ReadKind::Text,
-                    image_permit: None,
-                },
-            )
+            .submit_reserved_read(reservation, ReadJob {
+                slot: Arc::downgrade(&slot),
+                fd: read,
+                deadline: Instant::now() + Duration::from_millis(5),
+                max_bytes: 16,
+                kind: ReadKind::Text,
+                image_permit: None,
+            })
             .unwrap();
         std::thread::sleep(Duration::from_millis(15));
 
@@ -7411,16 +7385,13 @@ mod tests {
         let reservation = workers.reserve_write().unwrap();
         assert_eq!(reservation, Reservation::Queued);
         workers
-            .submit_reserved_write(
-                reservation,
-                WriteJob {
-                    serving: Arc::downgrade(&serving),
-                    fd: write,
-                    payload: OwnedPayload::Text(Arc::from("queued")),
-                    _source_bytes: test_source_charge(0),
-                    deadline: Instant::now() + Duration::from_millis(5),
-                },
-            )
+            .submit_reserved_write(reservation, WriteJob {
+                serving: Arc::downgrade(&serving),
+                fd: write,
+                payload: OwnedPayload::Text(Arc::from("queued")),
+                _source_bytes: test_source_charge(0),
+                deadline: Instant::now() + Duration::from_millis(5),
+            })
             .unwrap();
         std::thread::sleep(Duration::from_millis(15));
 
@@ -7476,17 +7447,14 @@ mod tests {
         let reservation = workers.reserve_read().unwrap();
         assert_eq!(reservation, Reservation::Queued);
         workers
-            .submit_reserved_read(
-                reservation,
-                ReadJob {
-                    slot: Arc::downgrade(&queued_slot),
-                    fd: read,
-                    deadline: Instant::now() + Duration::from_secs(30),
-                    max_bytes: 16,
-                    kind: ReadKind::Text,
-                    image_permit: None,
-                },
-            )
+            .submit_reserved_read(reservation, ReadJob {
+                slot: Arc::downgrade(&queued_slot),
+                fd: read,
+                deadline: Instant::now() + Duration::from_secs(30),
+                max_bytes: 16,
+                kind: ReadKind::Text,
+                image_permit: None,
+            })
             .unwrap();
 
         queued_slot.cancel();
@@ -7526,17 +7494,14 @@ mod tests {
         let reservation = workers.reserve_read().unwrap();
         assert_eq!(reservation, Reservation::Queued);
         workers
-            .submit_reserved_read(
-                reservation,
-                ReadJob {
-                    slot: Arc::downgrade(&queued_slot),
-                    fd: read,
-                    deadline: Instant::now() + Duration::from_secs(30),
-                    max_bytes: 16,
-                    kind: ReadKind::Text,
-                    image_permit: None,
-                },
-            )
+            .submit_reserved_read(reservation, ReadJob {
+                slot: Arc::downgrade(&queued_slot),
+                fd: read,
+                deadline: Instant::now() + Duration::from_secs(30),
+                max_bytes: 16,
+                kind: ReadKind::Text,
+                image_permit: None,
+            })
             .unwrap();
 
         queued_slot.fail_internal(ClipboardError::Interrupted);
@@ -7571,17 +7536,14 @@ mod tests {
         let reservation = workers.reserve_read().unwrap();
         assert_eq!(reservation, Reservation::Queued);
         workers
-            .submit_reserved_read(
-                reservation,
-                ReadJob {
-                    slot: Arc::downgrade(&queued_slot),
-                    fd: read,
-                    deadline: Instant::now() + Duration::from_millis(80),
-                    max_bytes: 16,
-                    kind: ReadKind::Text,
-                    image_permit: None,
-                },
-            )
+            .submit_reserved_read(reservation, ReadJob {
+                slot: Arc::downgrade(&queued_slot),
+                fd: read,
+                deadline: Instant::now() + Duration::from_millis(80),
+                max_bytes: 16,
+                kind: ReadKind::Text,
+                image_permit: None,
+            })
             .unwrap();
 
         assert!(wait_until(Duration::from_secs(2), || queued_slot.is_finished()));
@@ -7608,16 +7570,13 @@ mod tests {
         let reservation = workers.reserve_write().unwrap();
         assert_eq!(reservation, Reservation::Queued);
         workers
-            .submit_reserved_write(
-                reservation,
-                WriteJob {
-                    serving: Arc::downgrade(&queued_serving),
-                    fd: write,
-                    payload: OwnedPayload::Text(Arc::from("queued")),
-                    _source_bytes: Arc::new(SourceBytesCharge::new(Arc::clone(&source_budget), 64)),
-                    deadline: Instant::now() + Duration::from_secs(30),
-                },
-            )
+            .submit_reserved_write(reservation, WriteJob {
+                serving: Arc::downgrade(&queued_serving),
+                fd: write,
+                payload: OwnedPayload::Text(Arc::from("queued")),
+                _source_bytes: Arc::new(SourceBytesCharge::new(Arc::clone(&source_budget), 64)),
+                deadline: Instant::now() + Duration::from_secs(30),
+            })
             .unwrap();
         assert_eq!(source_budget.used(), 64);
 
@@ -7671,17 +7630,14 @@ mod tests {
         let reservation = workers.reserve_write().unwrap();
         assert_eq!(reservation, Reservation::Queued);
         workers
-            .submit_reserved_write(
-                reservation,
-                WriteJob {
-                    serving: Arc::downgrade(&queued_serving),
-                    fd: write,
-                    // Smaller than the pipe capacity: a writer that started would deliver it.
-                    payload: OwnedPayload::Text(Arc::from("queued")),
-                    _source_bytes: test_source_charge(0),
-                    deadline: Instant::now() + Duration::from_millis(80),
-                },
-            )
+            .submit_reserved_write(reservation, WriteJob {
+                serving: Arc::downgrade(&queued_serving),
+                fd: write,
+                // Smaller than the pipe capacity: a writer that started would deliver it.
+                payload: OwnedPayload::Text(Arc::from("queued")),
+                _source_bytes: test_source_charge(0),
+                deadline: Instant::now() + Duration::from_millis(80),
+            })
             .unwrap();
 
         assert!(wait_until(Duration::from_secs(2), || queued_serving.error().is_some()));
@@ -8201,17 +8157,14 @@ mod tests {
         let reservation = workers.reserve_read().unwrap();
         assert_eq!(reservation, Reservation::Queued);
         let error = workers
-            .submit_reserved_read(
-                reservation,
-                ReadJob {
-                    slot: Arc::downgrade(&slot),
-                    fd: read,
-                    deadline: Instant::now() + Duration::from_secs(30),
-                    max_bytes: 16,
-                    kind: ReadKind::Text,
-                    image_permit: None,
-                },
-            )
+            .submit_reserved_read(reservation, ReadJob {
+                slot: Arc::downgrade(&slot),
+                fd: read,
+                deadline: Instant::now() + Duration::from_secs(30),
+                max_bytes: 16,
+                kind: ReadKind::Text,
+                image_permit: None,
+            })
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Other);
         assert!(error.to_string().contains("coordinator failed to start"));
@@ -8650,17 +8603,14 @@ mod tests {
         let reservation = workers.reserve_read().unwrap();
         assert_eq!(reservation, Reservation::Queued);
         workers
-            .submit_reserved_read(
-                reservation,
-                ReadJob {
-                    slot: Arc::downgrade(&queued_slot),
-                    fd: read,
-                    deadline: Instant::now() + Duration::from_secs(30),
-                    max_bytes: MAX_TRANSFER_BYTES,
-                    kind: ReadKind::ImagePng,
-                    image_permit: Some(permit),
-                },
-            )
+            .submit_reserved_read(reservation, ReadJob {
+                slot: Arc::downgrade(&queued_slot),
+                fd: read,
+                deadline: Instant::now() + Duration::from_secs(30),
+                max_bytes: MAX_TRANSFER_BYTES,
+                kind: ReadKind::ImagePng,
+                image_permit: Some(permit),
+            })
             .unwrap();
         assert_eq!(
             workers.inner.reads.lock().unwrap().jobs.len(),
@@ -8832,17 +8782,14 @@ mod tests {
         assert_eq!(budget.used(), MAX_TRANSFER_BYTES * 2);
         let reservation = workers.reserve_read().unwrap();
         workers
-            .submit_reserved_read(
-                reservation,
-                ReadJob {
-                    slot: Arc::downgrade(&slot),
-                    fd: read,
-                    deadline: Instant::now() + Duration::from_secs(2),
-                    max_bytes: MAX_TRANSFER_BYTES,
-                    kind: ReadKind::ImagePng,
-                    image_permit: Some(permit),
-                },
-            )
+            .submit_reserved_read(reservation, ReadJob {
+                slot: Arc::downgrade(&slot),
+                fd: read,
+                deadline: Instant::now() + Duration::from_secs(2),
+                max_bytes: MAX_TRANSFER_BYTES,
+                kind: ReadKind::ImagePng,
+                image_permit: Some(permit),
+            })
             .unwrap();
         assert!(wait_until(Duration::from_secs(2), || slot.is_finished()));
         assert_eq!(
@@ -8876,17 +8823,14 @@ mod tests {
         let permit = budget.try_acquire(MAX_TRANSFER_BYTES * 2).unwrap();
         let reservation = workers.reserve_read().unwrap();
         workers
-            .submit_reserved_read(
-                reservation,
-                ReadJob {
-                    slot: Arc::downgrade(&slot),
-                    fd: read,
-                    deadline: Instant::now() + Duration::from_secs(2),
-                    max_bytes: 4,
-                    kind: ReadKind::ImagePng,
-                    image_permit: Some(permit),
-                },
-            )
+            .submit_reserved_read(reservation, ReadJob {
+                slot: Arc::downgrade(&slot),
+                fd: read,
+                deadline: Instant::now() + Duration::from_secs(2),
+                max_bytes: 4,
+                kind: ReadKind::ImagePng,
+                image_permit: Some(permit),
+            })
             .unwrap();
         assert!(wait_until(Duration::from_secs(2), || slot.is_finished()));
         let handle = RegularTransferHandle { slot };
@@ -8908,17 +8852,14 @@ mod tests {
         let permit = budget.try_acquire(MAX_TRANSFER_BYTES * 2).unwrap();
         let reservation = workers.reserve_read().unwrap();
         workers
-            .submit_reserved_read(
-                reservation,
-                ReadJob {
-                    slot: Arc::downgrade(&slot),
-                    fd: read,
-                    deadline: Instant::now() + Duration::from_millis(30),
-                    max_bytes: MAX_TRANSFER_BYTES,
-                    kind: ReadKind::ImagePng,
-                    image_permit: Some(permit),
-                },
-            )
+            .submit_reserved_read(reservation, ReadJob {
+                slot: Arc::downgrade(&slot),
+                fd: read,
+                deadline: Instant::now() + Duration::from_millis(30),
+                max_bytes: MAX_TRANSFER_BYTES,
+                kind: ReadKind::ImagePng,
+                image_permit: Some(permit),
+            })
             .unwrap();
         assert!(wait_until(Duration::from_secs(2), || slot.is_finished()));
         let handle = RegularTransferHandle { slot };
@@ -8941,17 +8882,14 @@ mod tests {
         let permit = budget.try_acquire(MAX_TRANSFER_BYTES * 2).unwrap();
         let reservation = workers.reserve_read().unwrap();
         workers
-            .submit_reserved_read(
-                reservation,
-                ReadJob {
-                    slot: Arc::downgrade(&slot),
-                    fd: read,
-                    deadline: Instant::now() + Duration::from_secs(30),
-                    max_bytes: MAX_TRANSFER_BYTES,
-                    kind: ReadKind::ImagePng,
-                    image_permit: Some(permit),
-                },
-            )
+            .submit_reserved_read(reservation, ReadJob {
+                slot: Arc::downgrade(&slot),
+                fd: read,
+                deadline: Instant::now() + Duration::from_secs(30),
+                max_bytes: MAX_TRANSFER_BYTES,
+                kind: ReadKind::ImagePng,
+                image_permit: Some(permit),
+            })
             .unwrap();
         slot.cancel();
         assert!(wait_until(Duration::from_secs(2), || budget.used() == 0));
@@ -9064,17 +9002,14 @@ mod tests {
         let reservation = workers.reserve_read().unwrap();
         assert_eq!(reservation, Reservation::Queued);
         let error = workers
-            .submit_reserved_read(
-                reservation,
-                ReadJob {
-                    slot: Arc::downgrade(&slot),
-                    fd: read,
-                    deadline: Instant::now() + Duration::from_secs(30),
-                    max_bytes: 16,
-                    kind: ReadKind::Text,
-                    image_permit: None,
-                },
-            )
+            .submit_reserved_read(reservation, ReadJob {
+                slot: Arc::downgrade(&slot),
+                fd: read,
+                deadline: Instant::now() + Duration::from_secs(30),
+                max_bytes: 16,
+                kind: ReadKind::Text,
+                image_permit: None,
+            })
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Other);
         assert_eq!(

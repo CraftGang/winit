@@ -1331,6 +1331,25 @@ impl Window {
         self.window.maybe_queue_on_main(|w| w.reset_ime())
     }
 
+    /// Resets composition like [`Self::reset_ime`] and queues an ordered completion fence.
+    ///
+    /// A supported, allowed context that resets successfully receives
+    /// [`ImeResetCompleted`](crate::event::WindowEvent::ImeResetCompleted) with this
+    /// `request_id`, including when no preedit is visible. Already accepted input precedes the
+    /// fence; input admitted after cancellation follows it. The identifier is opaque to winit:
+    /// callers must distinguish outstanding requests and check the event's window as well.
+    ///
+    /// This acknowledges the local cancellation boundary, not a compositor response. It does
+    /// not retract text already committed by the input method. Unsupported platforms, an IME
+    /// that is not allowed, and native reset failures do not produce a successful completion.
+    /// Queued completion can be discarded if its window/context is invalidated before delivery.
+    /// See [`Self::reset_ime`] for platform cancellation behavior and limitations.
+    #[inline]
+    pub fn reset_ime_with_request(&self, request_id: u64) {
+        let _span = tracing::debug_span!("winit::Window::reset_ime_with_request").entered();
+        self.window.maybe_queue_on_main(move |w| w.reset_ime_with_request(request_id))
+    }
+
     /// Brings the window to the front and sets input focus. Has no effect if the window is
     /// already in focus, minimized, or not visible.
     ///

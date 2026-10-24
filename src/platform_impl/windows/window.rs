@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::mem::{self, MaybeUninit};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::{io, panic, ptr};
@@ -60,7 +61,8 @@ use crate::platform_impl::platform::dpi::{
 };
 use crate::platform_impl::platform::drop_handler::FileDropHandler;
 use crate::platform_impl::platform::event_loop::{
-    self, ActiveEventLoop, DESTROY_MSG_ID, RESET_IME_MSG_ID,
+    self, encode_ime_reset_request, ActiveEventLoop, DESTROY_MSG_ID, RESET_IME_MSG_ID,
+    RESET_IME_WITH_REQUEST_MSG_ID,
 };
 use crate::platform_impl::platform::icon::{self, IconType, WinCursor};
 use crate::platform_impl::platform::ime::ImeContext;
@@ -83,6 +85,7 @@ pub(crate) struct Window {
 
     /// The current window state.
     window_state: Arc<Mutex<WindowState>>,
+    ime_reset_alive: Arc<AtomicBool>,
 
     // The events loop proxy.
     thread_executor: event_loop::EventLoopThreadExecutor,
@@ -956,6 +959,15 @@ impl Window {
     }
 
     #[inline]
+    pub fn reset_ime_with_request(&self, request_id: u64) {
+        let window = self.window;
+        let (low, high) = encode_ime_reset_request(request_id);
+        self.thread_executor.execute_in_thread(move || unsafe {
+            SendMessageW(window, RESET_IME_WITH_REQUEST_MSG_ID.get(), low, high);
+        })
+    }
+
+    #[inline]
     pub fn request_user_attention(&self, request_type: Option<UserAttentionType>) {
         let window = self.window;
         let active_window_handle = unsafe { GetActiveWindow() };
@@ -1131,6 +1143,8 @@ impl Window {
 impl Drop for Window {
     #[inline]
     fn drop(&mut self) {
+        // Drop may occur on a different thread before its posted destroy message is handled.
+        self.ime_reset_alive.store(false, Ordering::Release);
         unsafe {
             // The window must be destroyed from the same thread that created it, so we send a
             // custom message to be handled by our callback to do the actual work.
@@ -1184,7 +1198,12 @@ impl InitData<'_> {
 
         unsafe { ImeContext::set_ime_allowed(window, false) };
 
-        Window { window, window_state, thread_executor: self.event_loop.create_thread_executor() }
+        Window {
+            window,
+            window_state,
+            ime_reset_alive: Arc::new(AtomicBool::new(true)),
+            thread_executor: self.event_loop.create_thread_executor(),
+        }
     }
 
     unsafe fn create_window_data(&self, win: &Window) -> event_loop::WindowData {
@@ -1228,6 +1247,7 @@ impl InitData<'_> {
             _file_drop_handler: file_drop_handler,
             userdata_removed: Cell::new(false),
             recurse_depth: Cell::new(0),
+            ime_reset_alive: Arc::clone(&win.ime_reset_alive),
         }
     }
 

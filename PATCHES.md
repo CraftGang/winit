@@ -197,3 +197,27 @@ races, other compositors, Windows/macOS, full application GUI behavior or perfor
 full publication matrix and final immutable dependency locks remain separate landing gates.
 The plan document retains earlier boundary descriptions as historical implementation notes;
 this entry records the integrated state.
+
+## Ordered IME reset completion
+
+`Window::reset_ime_with_request(request_id)` adds an ordered cancellation boundary for custom
+editors. `WindowEvent::ImeResetCompleted { request_id }` identifies the requesting native window
+and follows input already accepted by its old composition. Fresh input follows that boundary.
+The existing `reset_ime()` API keeps its behavior. Integrations must correlate the request with
+their current editor owner, context and purpose; a completion alone does not identify an editor.
+
+X11, Wayland, Windows and macOS implement the boundary. Unsupported backends and failed native
+resets do not fabricate completion. A valid empty native context can complete without visible
+preedit. Wayland completion is a local ordered boundary, not a compositor acknowledgement.
+Window or context invalidation can discard queued completion. Windows admits a
+native message's copied result before invoking callbacks; macOS defers completion until an outer
+text callback finishes publishing its accepted payload. Wayland publishes while holding the
+window's input lock and checks closure again before each application callback.
+
+Linux validation passed 207 library tests, 44 IME source guards and 17 other target tests, strict
+all-target lint, reduced-feature X11/Wayland checks and nightly formatting. Two regression tests
+first reproduced suffix overtaking and completion after closure. All targets also passed
+cross-compilation checks for Windows x86_64 GNU and macOS AArch64. Cross-compilation does not
+execute native tests. The main-thread AppKit harness, Windows native message/IMM tests, live
+XIM/Wayland input methods, matching egui adapter and downstream custom editors remain separate
+qualification gates. Human review and merge are required.

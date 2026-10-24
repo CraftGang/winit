@@ -927,6 +927,9 @@ impl Window {
 
     pub fn reset_ime(&self) {}
 
+    #[inline]
+    pub fn reset_ime_with_request(&self, _request_id: u64) {}
+
     pub fn focus_window(&self) {}
 
     pub fn request_user_attention(&self, _request_type: Option<window::UserAttentionType>) {}

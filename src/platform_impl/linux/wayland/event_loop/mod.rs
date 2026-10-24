@@ -474,40 +474,32 @@ impl<T: 'static> EventLoop<T> {
                     .map_or(true, |requests| requests.is_closed())
             })
         });
-        for (event, delete) in deliverable {
-            let event = event.map_nonuser_event().unwrap();
-            // Recheck the tombstone immediately before every callback, not only while draining.
-            // Another thread can close and drop the window after the drain filtered the queue but
-            // before this callback runs.
-            let ime_window = match &event {
-                Event::WindowEvent { window_id, event: WindowEvent::Ime(_) } => Some(window_id.0),
-                _ => None,
-            };
-            if ime_window.is_some_and(|window_id| {
-                self.with_state(|state| {
+        dispatch_ime_events(
+            deliverable,
+            self,
+            |this, window_id| {
+                this.with_state(|state| {
                     state
                         .window_requests
                         .get_mut()
                         .get(&window_id)
                         .map_or(true, |requests| requests.is_closed())
                 })
-            }) {
-                continue;
-            }
-            // Hand the window the deletion that goes with this commit, for
-            // `WindowExtWayland::take_ime_delete_surrounding`. The deletion travels with its
-            // commit event, so another window's commit cannot consume it.
-            if let Event::WindowEvent { window_id, event: WindowEvent::Ime(Ime::Commit(_)) } =
-                &event
-            {
-                self.with_state(|state| {
-                    if let Some(window) = state.windows.get_mut().get(&window_id.0) {
-                        window.lock().unwrap().ime_delete_surrounding = delete;
-                    }
-                });
-            }
-            callback(event, &self.window_target);
-        }
+            },
+            |this, event, delete| {
+                // Attach deletion only to the actual commit callback.
+                if let Event::WindowEvent { window_id, event: WindowEvent::Ime(Ime::Commit(_)) } =
+                    &event
+                {
+                    this.with_state(|state| {
+                        if let Some(window) = state.windows.get_mut().get(&window_id.0) {
+                            window.lock().unwrap().ime_delete_surrounding = delete;
+                        }
+                    });
+                }
+                callback(event, &this.window_target);
+            },
+        );
 
         // Collect the window ids
         self.with_state(|state| {
@@ -856,4 +848,57 @@ enum PumpEventNotifierAction {
     Pause,
     /// Shutdown the thread.
     Shutdown,
+}
+
+/// The final callback boundary, after sinks have already been drained into a local vector.
+fn dispatch_ime_events<T: 'static, C>(
+    deliverable: Vec<(Event<()>, Option<crate::platform::wayland::ImeDeleteSurrounding>)>,
+    context: &mut C,
+    mut is_closed: impl FnMut(&mut C, WindowId) -> bool,
+    mut callback: impl FnMut(&mut C, Event<T>, Option<crate::platform::wayland::ImeDeleteSurrounding>),
+) {
+    for (event, delete) in deliverable {
+        let event = event.map_nonuser_event().unwrap();
+        let ime_window = sink::ime_event_window(&event);
+        if ime_window.is_some_and(|window| is_closed(context, window)) {
+            continue;
+        }
+        callback(context, event, delete);
+    }
+}
+
+#[cfg(test)]
+mod ime_callback_boundary_tests {
+    use std::cell::Cell;
+
+    use super::{dispatch_ime_events, EventSink, WindowId};
+    use crate::event::{Event, Ime, WindowEvent};
+
+    #[test]
+    fn close_from_preceding_callback_suppresses_already_drained_completion() {
+        let first = WindowId::from(1);
+        let closing = WindowId::from(2);
+        let mut sink = EventSink::new();
+        sink.push_window_event(WindowEvent::Focused(true), first);
+        sink.push_window_event(WindowEvent::ImeResetCompleted { request_id: 7 }, closing);
+        sink.push_window_event(WindowEvent::Ime(Ime::Commit("old".into())), closing);
+        let drained = sink.drain_deliverable();
+        let closed = Cell::new(false);
+        let mut delivered = Vec::new();
+        dispatch_ime_events::<(), _>(
+            drained,
+            &mut (),
+            |_, window| window == closing && closed.get(),
+            |_, event, _| {
+                if matches!(event, Event::WindowEvent { window_id, .. } if window_id.0 == first) {
+                    closed.set(true);
+                }
+                delivered.push(event);
+            },
+        );
+        assert_eq!(delivered, vec![Event::WindowEvent {
+            window_id: crate::window::WindowId(first),
+            event: WindowEvent::Focused(true),
+        }]);
+    }
 }
