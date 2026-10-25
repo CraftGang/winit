@@ -265,6 +265,9 @@ rustix = { version = "0.38.4", default-features = false, features = [
     "system",
     "thread",
     "process",
+    "event",
+    "fs",
+    "pipe",
 ] }
 sctk = { package = "smithay-client-toolkit", version = "0.19.2", default-features = false, features = [
     "calloop",
@@ -382,4 +385,9 @@ mint = "0.5.6"
 [[test]]
 name = "macos_termination"
 path = "tests/macos_termination.rs"
+harness = false
+
+[[test]]
+name = "ime_reset_dispatch"
+path = "tests/ime_reset_dispatch.rs"
 harness = false

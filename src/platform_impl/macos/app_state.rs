@@ -29,6 +29,7 @@ pub(super) struct AppState {
     termination_queued: Cell<bool>,
     run_loop: RunLoop,
     event_handler: EventHandler,
+    pending_dispatch: Cell<usize>,
     stop_on_launch: Cell<bool>,
     stop_before_wait: Cell<bool>,
     stop_after_wait: Cell<bool>,
@@ -98,6 +99,7 @@ impl ApplicationDelegate {
             termination_queued: Cell::new(false),
             run_loop: RunLoop::main(mtm),
             event_handler: EventHandler::new(),
+            pending_dispatch: Cell::new(0),
             stop_on_launch: Cell::new(false),
             stop_before_wait: Cell::new(false),
             stop_after_wait: Cell::new(false),
@@ -321,6 +323,22 @@ impl ApplicationDelegate {
         self.maybe_queue_event(Event::WindowEvent { window_id: RootWindowId(window_id), event });
     }
 
+    /// Run `handle` while no event is being handled: now, or after the current event, in order
+    /// with the events queued by `maybe_queue_window_event`.
+    pub fn maybe_queue_handler(&self, handle: impl FnOnce(&Self) + 'static) {
+        if !self.ivars().event_handler.in_use() && self.ivars().pending_dispatch.get() == 0 {
+            handle(self);
+        } else {
+            let pending = &self.ivars().pending_dispatch;
+            pending.set(pending.get().checked_add(1).expect("deferred dispatch count exhausted"));
+            let this = self.retain();
+            self.ivars().run_loop.queue_closure(move || {
+                let _pending = PendingDispatch(&this.ivars().pending_dispatch);
+                handle(&this);
+            });
+        }
+    }
+
     pub fn handle_window_event(&self, window_id: WindowId, event: WindowEvent) {
         self.handle_event(Event::WindowEvent { window_id: RootWindowId(window_id), event });
     }
@@ -365,13 +383,9 @@ impl ApplicationDelegate {
         // However, it is not documented which actions do this, and which ones are done immediately,
         // so to make sure that we don't encounter re-entrancy issues, we first check if we're
         // currently handling another event, and if we are, we queue the event instead.
-        if !self.ivars().event_handler.in_use() {
-            self.handle_event(event);
-        } else {
-            tracing::debug!(?event, "had to queue event since another is currently being handled");
-            let this = self.retain();
-            self.ivars().run_loop.queue_closure(move || this.handle_event(event));
-        }
+        // A native interpretKeyEvents call can resume after an app callback but before its
+        // deferred work runs. Both events and attached-delete handlers must join that FIFO.
+        self.maybe_queue_handler(move |this| this.handle_event(event));
     }
 
     #[track_caller]
@@ -498,4 +512,33 @@ fn window_activation_hack(app: &NSApplication) {
             tracing::trace!("Skipping activating invisible window");
         }
     })
+}
+
+/// Includes the currently running deferred handler so nested native callbacks stay behind it.
+struct PendingDispatch<'a>(&'a Cell<usize>);
+
+impl Drop for PendingDispatch<'_> {
+    fn drop(&mut self) {
+        // Cleanup must also run while a callback unwinds; never panic a second time here.
+        self.0.set(self.0.get().saturating_sub(1));
+    }
+}
+
+#[cfg(test)]
+mod deferred_dispatch_cleanup_tests {
+    use std::cell::Cell;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use super::PendingDispatch;
+
+    #[test]
+    fn deferred_count_is_released_when_callback_panics() {
+        let pending = Cell::new(1);
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            let _guard = PendingDispatch(&pending);
+            panic!("callback failure");
+        }))
+        .is_err());
+        assert_eq!(pending.get(), 0);
+    }
 }

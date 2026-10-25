@@ -241,7 +241,10 @@ mod tests {
             assert_eq!(default_dpi_factor(None, PIXELS, screen_mm, PIXELS, PANEL), physical_scale);
         }
         for screen_pixels in [(0, 1080), (1920, 0), (0, 0)] {
-            assert_eq!(default_dpi_factor(None, screen_pixels, SCREEN_96, PIXELS, PANEL), physical_scale);
+            assert_eq!(
+                default_dpi_factor(None, screen_pixels, SCREEN_96, PIXELS, PANEL),
+                physical_scale
+            );
         }
         assert_eq!(default_dpi_factor(None, PIXELS, (0, 0), PIXELS, (0, 0)), 1.0);
     }
