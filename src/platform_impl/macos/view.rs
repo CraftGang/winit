@@ -623,10 +623,10 @@ declare_class!(
                 self.ivars().ime_document.borrow_mut().reset();
             }
 
+            self.ivars().key_interpreted.set(false);
             if self.ivars().ime_allowed.get() {
                 let events_for_nsview = NSArray::from_slice(&[&*event]);
                 self.ivars().in_key_down.set(true);
-                self.ivars().key_interpreted.set(false);
                 let outer_key = self.ivars().key_characters.replace(Some(characters));
                 unsafe { self.interpretKeyEvents(&events_for_nsview) };
 
@@ -669,10 +669,12 @@ declare_class!(
             // ground state, so the space arrived twice (rust-windowing/winit#4478).
             let had_ime_input = self.ivars().committed_in_key_down.replace(false) || had_ime_input;
 
-            // With press-and-hold, the input method takes the repeats of a held letter to show its
-            // accent menu and calls nothing back. Their text isn't typed.
+            // A key the input method takes calls none of `insertText`, `setMarkedText`,
+            // `unmarkText` or `doCommandBySelector`. With press-and-hold, these are the repeats of
+            // the held letter and the keys that work its accent menu: a digit picks an accent, and
+            // macOS then replaces the letter with `insertText`. Sending the digit's text as well
+            // would type it, and the replacement would remove it instead of the letter.
             let held_for_accents = self.ivars().ime_allowed.get()
-                && unsafe { event.isARepeat() }
                 && !self.ivars().key_interpreted.get()
                 && !modifiers.intersects(ModifiersState::SUPER | ModifiersState::CONTROL);
 
